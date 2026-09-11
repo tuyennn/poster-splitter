@@ -118,7 +118,7 @@ def pick_side(left: np.ndarray, right: np.ndarray) -> np.ndarray:
 
 def split_poster(
     img: np.ndarray,
-    side: Side = "auto",
+    side: Side = "right",
     midline: float = 0.5,
 ) -> np.ndarray:
     if not 0.0 < midline < 1.0:
