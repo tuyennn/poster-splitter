@@ -82,11 +82,12 @@ def decode_image(data: bytes) -> np.ndarray:
     return img
 
 
-def _count_faces(img: np.ndarray) -> int:
-    """Returns face count, or -1 if face detection isn't usable in this environment."""
+def _largest_face_area(img: np.ndarray) -> float:
+    """Returns the area (px²) of the largest detected face, 0.0 if none
+    found, or -1.0 if face detection isn't usable in this environment."""
     global _face_detection_unavailable
     if _face_detection_unavailable:
-        return -1
+        return -1.0
     try:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         gray = cv2.equalizeHist(gray)
@@ -96,7 +97,9 @@ def _count_faces(img: np.ndarray) -> int:
             minNeighbors=4,
             minSize=(30, 30),
         )
-        return len(faces)
+        if len(faces) == 0:
+            return 0.0
+        return max(float(w * h) for (_x, _y, w, h) in faces)
     except (AttributeError, cv2.error) as exc:
         # Broken/incompatible OpenCV build (e.g. conflicting opencv-python /
         # opencv-python-headless installs leave cv2.CascadeClassifier missing).
@@ -108,7 +111,7 @@ def _count_faces(img: np.ndarray) -> int:
             exc,
         )
         _face_detection_unavailable = True
-        return -1
+        return -1.0
 
 
 def _visual_interest(img: np.ndarray) -> float:
@@ -120,31 +123,62 @@ def _visual_interest(img: np.ndarray) -> float:
     return edge_density * 1000.0 + lap_var
 
 
-def pick_side(left: np.ndarray, right: np.ndarray) -> np.ndarray:
-    left_faces = _count_faces(left)
-    right_faces = _count_faces(right)
+def pick_side(left: np.ndarray, right: np.ndarray) -> tuple[np.ndarray, Literal["left", "right"]]:
+    left_area = _largest_face_area(left)
+    right_area = _largest_face_area(right)
 
-    if left_faces > 0 and right_faces == 0:
-        return left
-    if right_faces > 0 and left_faces == 0:
-        return right
+    if left_area > 0.0 or right_area > 0.0:
+        # At least one side has a detected face — prefer whichever side's
+        # biggest face is larger (a -1 "unavailable" side loses to any
+        # real, even small, detected face).
+        if left_area >= right_area:
+            return left, "left"
+        return right, "right"
 
-    # Both or neither have faces → visual interest fallback
+    # No faces detected on either side (or detection is unavailable) →
+    # visual interest fallback.
     if _visual_interest(left) >= _visual_interest(right):
-        return left
-    return right
+        return left, "left"
+    return right, "right"
+
+
+def _trim_spine(img: np.ndarray, side: Literal["left", "right"], spine_trim: float) -> np.ndarray:
+    """Trim a sliver off the inner edge (nearest the midline) to drop the
+    spine/gutter divider between the two DVD cover panels."""
+    if spine_trim <= 0.0:
+        return img
+
+    width = img.shape[1]
+    trim_px = int(round(width * spine_trim))
+    trim_px = max(0, min(trim_px, width - 1))  # always keep at least 1px
+    if trim_px == 0:
+        return img
+
+    if side == "left":
+        # Spine sits along this half's RIGHT edge.
+        return img[:, : width - trim_px]
+    # side == "right": spine sits along this half's LEFT edge.
+    return img[:, trim_px:]
 
 
 def split_poster(
     img: np.ndarray,
     side: Side = "auto",
     midline: float = 0.5,
+    spine_trim: float = 0.0,
 ) -> np.ndarray:
     if not 0.0 < midline < 1.0:
         raise SplitterError(
             400,
             "invalid_param",
             "midline must be a float strictly between 0 and 1.",
+        )
+
+    if not 0.0 <= spine_trim < 1.0:
+        raise SplitterError(
+            400,
+            "invalid_param",
+            "spine_trim must be a float between 0 (inclusive) and 1 (exclusive).",
         )
 
     height, width = img.shape[:2]
@@ -156,10 +190,13 @@ def split_poster(
     right = img[:, split_x:]
 
     if side == "left":
-        return left
-    if side == "right":
-        return right
-    return pick_side(left, right)
+        chosen, chosen_side = left, "left"
+    elif side == "right":
+        chosen, chosen_side = right, "right"
+    else:
+        chosen, chosen_side = pick_side(left, right)
+
+    return _trim_spine(chosen, chosen_side, spine_trim)
 
 
 def encode_png(img: np.ndarray) -> bytes:

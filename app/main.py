@@ -53,6 +53,14 @@ async def poster(
         0.5,
         description="Vertical split position as a fraction of width (0–1)",
     ),
+    spine_trim: float = Query(
+        0.05,
+        description=(
+            "Fraction of the returned half's width to trim off its inner "
+            "edge (nearest the midline), to drop the spine/gutter divider "
+            "between the two DVD panels. 0 disables trimming."
+        ),
+    ),
 ) -> Response:
     if not url or not url.strip():
         return JSONResponse(
@@ -72,10 +80,19 @@ async def poster(
             },
         )
 
+    if spine_trim < 0.0 or spine_trim >= 1.0:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "invalid_param",
+                "detail": "spine_trim must be a float between 0 (inclusive) and 1 (exclusive).",
+            },
+        )
+
     try:
         data = await fetch_image(url)
         img = decode_image(data)
-        cropped = split_poster(img, side=side, midline=midline)
+        cropped = split_poster(img, side=side, midline=midline, spine_trim=spine_trim)
         png_bytes = encode_png(cropped)
         return Response(content=png_bytes, media_type="image/png")
 
