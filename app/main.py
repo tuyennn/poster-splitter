@@ -46,7 +46,7 @@ async def poster(
         None, description="Full-size source image URL to split"
     ),
     side: Literal["left", "right", "auto"] = Query(
-        "auto",
+        "right",
         description="Which half to return: left, right, or auto (face/interest detection)",
     ),
     midline: float = Query(
