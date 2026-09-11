@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Literal, Optional
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, Response
 
 from app.fetcher import FetcherError, fetch_image
 from app.splitter import SplitterError, decode_image, encode_png, split_poster
+
+logger = logging.getLogger("poster_splitter")
 
 app = FastAPI(
     title="Poster Splitter",
@@ -18,6 +21,18 @@ app = FastAPI(
     ),
     version="1.0.0",
 )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    # Safety net: any bug that isn't already turned into a FetcherError/
+    # SplitterError still gets logged with a full traceback server-side
+    # and returns a structured JSON body instead of a bare 500 page.
+    logger.exception("Unhandled exception while processing %s", request.url)
+    return JSONResponse(
+        status_code=500,
+        content={"error": "internal_error", "detail": "An unexpected error occurred."},
+    )
 
 
 @app.get("/health")

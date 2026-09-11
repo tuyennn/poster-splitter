@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Literal
 
 import cv2
@@ -29,6 +30,7 @@ class SplitterError(Exception):
 
 
 _face_cascade: cv2.CascadeClassifier | None = None
+_face_detection_unavailable = False  # sticky flag once we've confirmed it's broken
 
 
 def _get_face_cascade() -> cv2.CascadeClassifier:
@@ -81,15 +83,32 @@ def decode_image(data: bytes) -> np.ndarray:
 
 
 def _count_faces(img: np.ndarray) -> int:
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    gray = cv2.equalizeHist(gray)
-    faces = _get_face_cascade().detectMultiScale(
-        gray,
-        scaleFactor=1.1,
-        minNeighbors=4,
-        minSize=(30, 30),
-    )
-    return len(faces)
+    """Returns face count, or -1 if face detection isn't usable in this environment."""
+    global _face_detection_unavailable
+    if _face_detection_unavailable:
+        return -1
+    try:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        gray = cv2.equalizeHist(gray)
+        faces = _get_face_cascade().detectMultiScale(
+            gray,
+            scaleFactor=1.1,
+            minNeighbors=4,
+            minSize=(30, 30),
+        )
+        return len(faces)
+    except (AttributeError, cv2.error) as exc:
+        # Broken/incompatible OpenCV build (e.g. conflicting opencv-python /
+        # opencv-python-headless installs leave cv2.CascadeClassifier missing).
+        # Don't fail every request over an optional heuristic — log once and
+        # fall back to the visual-interest comparison instead.
+        logging.getLogger(__name__).error(
+            "Face detection unavailable, falling back to visual-interest "
+            "heuristic for side='auto': %s",
+            exc,
+        )
+        _face_detection_unavailable = True
+        return -1
 
 
 def _visual_interest(img: np.ndarray) -> float:
