@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Literal, Optional
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, Response
 
 from app.fetcher import FetcherError, fetch_image
 from app.splitter import SplitterError, decode_image, encode_png, split_poster
+
+logger = logging.getLogger("poster_splitter")
 
 app = FastAPI(
     title="Poster Splitter",
@@ -18,6 +21,18 @@ app = FastAPI(
     ),
     version="1.0.0",
 )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    # Safety net: any bug that isn't already turned into a FetcherError/
+    # SplitterError still gets logged with a full traceback server-side
+    # and returns a structured JSON body instead of a bare 500 page.
+    logger.exception("Unhandled exception while processing %s", request.url)
+    return JSONResponse(
+        status_code=500,
+        content={"error": "internal_error", "detail": "An unexpected error occurred."},
+    )
 
 
 @app.get("/health")
@@ -38,6 +53,14 @@ async def poster(
         0.5,
         description="Vertical split position as a fraction of width (0–1)",
     ),
+    spine_trim: float = Query(
+        0.05,
+        description=(
+            "Fraction of the returned half's width to trim off its inner "
+            "edge (nearest the midline), to drop the spine/gutter divider "
+            "between the two DVD panels. 0 disables trimming."
+        ),
+    ),
 ) -> Response:
     if not url or not url.strip():
         return JSONResponse(
@@ -57,10 +80,19 @@ async def poster(
             },
         )
 
+    if spine_trim < 0.0 or spine_trim >= 1.0:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "invalid_param",
+                "detail": "spine_trim must be a float between 0 (inclusive) and 1 (exclusive).",
+            },
+        )
+
     try:
         data = await fetch_image(url)
         img = decode_image(data)
-        cropped = split_poster(img, side=side, midline=midline)
+        cropped = split_poster(img, side=side, midline=midline, spine_trim=spine_trim)
         png_bytes = encode_png(cropped)
         return Response(content=png_bytes, media_type="image/png")
 

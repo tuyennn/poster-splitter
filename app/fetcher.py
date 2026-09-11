@@ -11,6 +11,7 @@ import magic
 
 MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MB
 FETCH_TIMEOUT = 10.0
+MAX_REDIRECTS = 5
 
 # Normalize aliases for comparison
 CONTENT_TYPE_CANONICAL = {
@@ -143,87 +144,83 @@ def validate_url(url: str) -> str:
     return url
 
 
-def _check_redirect_ssrf(response: httpx.Response) -> None:
-    """Re-validate final URL after redirects (SSRF after hop)."""
-    final = str(response.url)
-    parsed = urlparse(final)
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise FetcherError(
-            400,
-            "invalid_url",
-            "Redirect landed on a non-http(s) or hostless URL.",
-        )
-    try:
-        ip = ipaddress.ip_address(parsed.hostname)
-        if _is_private_ip(ip):
-            raise FetcherError(
-                400,
-                "invalid_url",
-                "Redirect targets a private or reserved IP address.",
-            )
-    except ValueError:
-        _resolve_and_check_host(parsed.hostname)
-
-
 async def fetch_image(url: str) -> bytes:
     """
     Stream-download an image with Content-Length + mid-stream size caps,
     dual MIME validation (header + magic sniff), and SSRF guards.
     """
-    url = validate_url(url)
-
     try:
+        url = validate_url(url)
+
         async with httpx.AsyncClient(
             timeout=FETCH_TIMEOUT,
-            follow_redirects=True,
-            max_redirects=5,
+            follow_redirects=False,
         ) as client:
-            async with client.stream("GET", url) as response:
-                _check_redirect_ssrf(response)
+            for hop in range(MAX_REDIRECTS + 1):
+                async with client.stream("GET", url) as response:
+                    if response.is_redirect:
+                        if hop == MAX_REDIRECTS:
+                            raise FetcherError(
+                                502, "fetch_failed", "Too many redirects."
+                            )
+                        location = response.headers.get("location")
+                        if not location:
+                            raise FetcherError(
+                                502,
+                                "fetch_failed",
+                                "Redirect response missing Location header.",
+                            )
+                        # Resolve + SSRF-validate the NEXT hop's host
+                        # BEFORE we ever open a connection to it.
+                        url = validate_url(str(response.url.join(location)))
+                        continue
 
-                if response.status_code < 200 or response.status_code >= 300:
-                    raise FetcherError(
-                        502,
-                        "fetch_failed",
-                        f"Source URL returned HTTP {response.status_code}.",
-                    )
-
-                declared = _normalize_content_type(response.headers.get("content-type"))
-                if declared is None or declared not in CONTENT_TYPE_CANONICAL.values():
-                    raise FetcherError(
-                        400,
-                        "invalid_image",
-                        "Content-Type is not a valid JPEG/PNG/WEBP image.",
-                    )
-
-                content_length = response.headers.get("content-length")
-                if content_length is not None:
-                    try:
-                        length = int(content_length)
-                    except ValueError:
-                        length = -1
-                    if length > MAX_IMAGE_BYTES:
+                    if response.status_code < 200 or response.status_code >= 300:
                         raise FetcherError(
-                            413,
-                            "invalid_image",
-                            f"File exceeds maximum allowed size of "
-                            f"{MAX_IMAGE_BYTES // (1024 * 1024)}MB.",
+                            502,
+                            "fetch_failed",
+                            f"Source URL returned HTTP {response.status_code}.",
                         )
 
-                chunks: list[bytes] = []
-                total = 0
-                async for chunk in response.aiter_bytes():
-                    total += len(chunk)
-                    if total > MAX_IMAGE_BYTES:
+                    declared = _normalize_content_type(
+                        response.headers.get("content-type")
+                    )
+                    if declared is None or declared not in CONTENT_TYPE_CANONICAL.values():
                         raise FetcherError(
-                            413,
+                            400,
                             "invalid_image",
-                            f"File exceeds maximum allowed size of "
-                            f"{MAX_IMAGE_BYTES // (1024 * 1024)}MB.",
+                            "Content-Type is not a valid JPEG/PNG/WEBP image.",
                         )
-                    chunks.append(chunk)
 
-                data = b"".join(chunks)
+                    content_length = response.headers.get("content-length")
+                    if content_length is not None:
+                        try:
+                            length = int(content_length)
+                        except ValueError:
+                            length = -1
+                        if length > MAX_IMAGE_BYTES:
+                            raise FetcherError(
+                                413,
+                                "invalid_image",
+                                f"File exceeds maximum allowed size of "
+                                f"{MAX_IMAGE_BYTES // (1024 * 1024)}MB.",
+                            )
+
+                    chunks: list[bytes] = []
+                    total = 0
+                    async for chunk in response.aiter_bytes():
+                        total += len(chunk)
+                        if total > MAX_IMAGE_BYTES:
+                            raise FetcherError(
+                                413,
+                                "invalid_image",
+                                f"File exceeds maximum allowed size of "
+                                f"{MAX_IMAGE_BYTES // (1024 * 1024)}MB.",
+                            )
+                        chunks.append(chunk)
+
+                    data = b"".join(chunks)
+                    break
 
     except FetcherError:
         raise
@@ -238,6 +235,16 @@ async def fetch_image(url: str) -> bytes:
             502,
             "fetch_failed",
             f"Could not fetch the source URL: {exc}",
+        ) from exc
+    except Exception as exc:
+        # Catches httpx exceptions that don't inherit from HTTPError
+        # (e.g. InvalidURL, CookieConflict, StreamConsumed/StreamClosed)
+        # plus any other unexpected failure during the fetch, so callers
+        # always get a structured FetcherError instead of a raw 500.
+        raise FetcherError(
+            502,
+            "fetch_failed",
+            f"Unexpected error while fetching the source URL: {exc}",
         ) from exc
 
     if not data:

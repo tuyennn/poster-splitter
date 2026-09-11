@@ -91,5 +91,5 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ## Auto side selection
 
-1. Haar cascade face detection on each half — prefer the half with faces
+1. Haar cascade face detection on each half — prefer the half with faces and biggest face
 2. If both/neither have faces, pick by Canny edge density + Laplacian variance
