@@ -9,7 +9,7 @@ Stateless FastAPI service that fetches a landscape double-DVD combo poster, crop
 | Param     | Required | Default | Description                                      |
 |-----------|----------|---------|--------------------------------------------------|
 | `url`     | yes      | —       | Source image URL (`http` / `https`)              |
-| `side`    | no       | `auto`  | `left` \| `right` \| `auto`                      |
+| `side`    | no       | `right`  | `left` \| `right` \| `auto`                      |
 | `midline` | no       | `0.5`   | Vertical split as fraction of width (`0`–`1`)    |
 
 - **200** — `Content-Type: image/png` (cropped panel)
