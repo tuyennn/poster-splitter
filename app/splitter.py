@@ -1,8 +1,10 @@
-"""In-memory OpenCV poster splitting: midline crop + auto face/interest pick."""
+"""In-memory OpenCV poster splitting: midline crop + auto person/interest pick."""
 
 from __future__ import annotations
 
 import logging
+import os
+from pathlib import Path
 from typing import Literal
 
 import cv2
@@ -17,6 +19,15 @@ MAX_ASPECT = 2.2
 # Decompression-bomb guard (~40 megapixels)
 MAX_MEGAPIXELS = 40_000_000
 
+# --- YOLOv8n person detector (cv2.dnn, ONNX — no torch at runtime) ---
+YOLO_MODEL_PATH = os.environ.get(
+    "YOLO_MODEL_PATH", str(Path(__file__).parent / "models" / "yolov8n.onnx")
+)
+YOLO_INPUT_SIZE = 640
+YOLO_CONF_THRESH = 0.4
+YOLO_NMS_THRESH = 0.45
+COCO_PERSON_CLASS_ID = 0
+
 
 class SplitterError(Exception):
     def __init__(self, status_code: int, error: str, detail: str):
@@ -29,23 +40,16 @@ class SplitterError(Exception):
         return {"error": self.error, "detail": self.detail}
 
 
-_face_cascade: cv2.CascadeClassifier | None = None
-_face_detection_unavailable = False  # sticky flag once we've confirmed it's broken
+_yolo_net: cv2.dnn.Net | None = None
+_yolo_unavailable = False  # sticky flag once we've confirmed it's broken/missing
 
 
-def _get_face_cascade() -> cv2.CascadeClassifier:
-    global _face_cascade
-    if _face_cascade is None:
-        path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        cascade = cv2.CascadeClassifier(path)
-        if cascade.empty():
-            raise SplitterError(
-                500,
-                "internal_error",
-                "Failed to load Haar cascade face detector.",
-            )
-        _face_cascade = cascade
-    return _face_cascade
+def _get_yolo_net() -> cv2.dnn.Net:
+    global _yolo_net
+    if _yolo_net is None:
+        net = cv2.dnn.readNetFromONNX(YOLO_MODEL_PATH)
+        _yolo_net = net
+    return _yolo_net
 
 
 def decode_image(data: bytes) -> np.ndarray:
@@ -82,35 +86,64 @@ def decode_image(data: bytes) -> np.ndarray:
     return img
 
 
-def _largest_face_area(img: np.ndarray) -> float:
-    """Returns the area (px²) of the largest detected face, 0.0 if none
-    found, or -1.0 if face detection isn't usable in this environment."""
-    global _face_detection_unavailable
-    if _face_detection_unavailable:
+def _largest_person_area(img: np.ndarray) -> float:
+    """Returns the area (px²) of the largest detected person, 0.0 if none
+    found, or -1.0 if the detector isn't usable in this environment."""
+    global _yolo_unavailable
+    if _yolo_unavailable:
         return -1.0
     try:
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        gray = cv2.equalizeHist(gray)
-        faces = _get_face_cascade().detectMultiScale(
-            gray,
-            scaleFactor=1.1,
-            minNeighbors=4,
-            minSize=(30, 30),
+        h, w = img.shape[:2]
+        scale = YOLO_INPUT_SIZE / max(h, w)
+        nh, nw = int(h * scale), int(w * scale)
+        resized = cv2.resize(img, (nw, nh))
+        canvas = np.full((YOLO_INPUT_SIZE, YOLO_INPUT_SIZE, 3), 114, dtype=np.uint8)
+        canvas[:nh, :nw] = resized
+
+        blob = cv2.dnn.blobFromImage(
+            canvas, scalefactor=1 / 255.0, size=(YOLO_INPUT_SIZE, YOLO_INPUT_SIZE), swapRB=True
         )
-        if len(faces) == 0:
+        net = _get_yolo_net()
+        net.setInput(blob)
+        out = net.forward()  # (1, 84, 8400)
+        out = out[0].T  # (8400, 84): [cx, cy, w, h, class0..class79]
+
+        boxes: list[list[float]] = []
+        scores: list[float] = []
+        class_scores = out[:, 4:]
+        class_ids = np.argmax(class_scores, axis=1)
+        confs = class_scores[np.arange(len(class_scores)), class_ids]
+        person_mask = (class_ids == COCO_PERSON_CLASS_ID) & (confs >= YOLO_CONF_THRESH)
+
+        for cx, cy, bw, bh in out[person_mask, :4]:
+            boxes.append([float(cx - bw / 2), float(cy - bh / 2), float(bw), float(bh)])
+        scores = [float(c) for c in confs[person_mask]]
+
+        if not boxes:
             return 0.0
-        return max(float(w * h) for (_x, _y, w, h) in faces)
-    except (AttributeError, cv2.error) as exc:
-        # Broken/incompatible OpenCV build (e.g. conflicting opencv-python /
-        # opencv-python-headless installs leave cv2.CascadeClassifier missing).
-        # Don't fail every request over an optional heuristic — log once and
-        # fall back to the visual-interest comparison instead.
+
+        idxs = cv2.dnn.NMSBoxes(boxes, scores, YOLO_CONF_THRESH, YOLO_NMS_THRESH)
+        if len(idxs) == 0:
+            return 0.0
+
+        best_area = 0.0
+        for i in np.array(idxs).flatten():
+            bw, bh = boxes[i][2], boxes[i][3]
+            # boxes are in the 640x640 letterboxed space — undo scale to
+            # get area back in the original image's pixel space.
+            area = (bw / scale) * (bh / scale)
+            best_area = max(best_area, area)
+        return best_area
+    except Exception as exc:
+        # Missing/corrupt model file, incompatible opencv build without dnn
+        # support, bad ONNX opset, etc. Don't fail every request over an
+        # optional heuristic — log once and fall back to visual-interest.
         logging.getLogger(__name__).error(
-            "Face detection unavailable, falling back to visual-interest "
+            "Person detection unavailable, falling back to visual-interest "
             "heuristic for side='auto': %s",
             exc,
         )
-        _face_detection_unavailable = True
+        _yolo_unavailable = True
         return -1.0
 
 
@@ -124,18 +157,18 @@ def _visual_interest(img: np.ndarray) -> float:
 
 
 def pick_side(left: np.ndarray, right: np.ndarray) -> tuple[np.ndarray, Literal["left", "right"]]:
-    left_area = _largest_face_area(left)
-    right_area = _largest_face_area(right)
+    left_area = _largest_person_area(left)
+    right_area = _largest_person_area(right)
 
     if left_area > 0.0 or right_area > 0.0:
-        # At least one side has a detected face — prefer whichever side's
-        # biggest face is larger (a -1 "unavailable" side loses to any
-        # real, even small, detected face).
+        # At least one side has a detected person — prefer whichever side's
+        # biggest person is larger (a -1 "unavailable" side loses to any
+        # real, even small, detection).
         if left_area >= right_area:
             return left, "left"
         return right, "right"
 
-    # No faces detected on either side (or detection is unavailable) →
+    # No people detected on either side (or detection is unavailable) →
     # visual interest fallback.
     if _visual_interest(left) >= _visual_interest(right):
         return left, "left"
@@ -161,11 +194,63 @@ def _trim_spine(img: np.ndarray, side: Literal["left", "right"], spine_trim: flo
     return img[:, trim_px:]
 
 
+def parse_ratio(value: str) -> float:
+    """Parse a target aspect ratio given as 'W:H' (e.g. '2:3') or a plain
+    decimal (e.g. '0.6667'). Returns width/height as a float."""
+    text = value.strip()
+    for sep in (":", "x", "/"):
+        if sep in text:
+            parts = text.split(sep)
+            if len(parts) != 2:
+                raise SplitterError(
+                    400, "invalid_param", f"Could not parse ratio '{value}'."
+                )
+            try:
+                w, h = float(parts[0]), float(parts[1])
+            except ValueError as exc:
+                raise SplitterError(
+                    400, "invalid_param", f"Could not parse ratio '{value}'."
+                ) from exc
+            if h <= 0:
+                raise SplitterError(
+                    400, "invalid_param", f"Invalid ratio '{value}': height must be > 0."
+                )
+            return w / h
+    try:
+        return float(text)
+    except ValueError as exc:
+        raise SplitterError(
+            400, "invalid_param", f"Could not parse ratio '{value}'."
+        ) from exc
+
+
+def _crop_to_ratio(img: np.ndarray, target_ratio: float) -> np.ndarray:
+    """Center-crop img (width/height) down to target_ratio. Only ever crops
+    (never pads/upscales), so the result is always a true subset of img."""
+    height, width = img.shape[:2]
+    current_ratio = width / height
+
+    if abs(current_ratio - target_ratio) < 1e-6:
+        return img
+
+    if current_ratio > target_ratio:
+        # Wider than target -> crop width, keep full height
+        new_width = max(1, min(width, round(height * target_ratio)))
+        x0 = (width - new_width) // 2
+        return img[:, x0 : x0 + new_width]
+
+    # Taller than target -> crop height, keep full width
+    new_height = max(1, min(height, round(width / target_ratio)))
+    y0 = (height - new_height) // 2
+    return img[y0 : y0 + new_height, :]
+
+
 def split_poster(
     img: np.ndarray,
-    side: Side = "right",
+    side: Side = "auto",
     midline: float = 0.5,
     spine_trim: float = 0.0,
+    target_ratio: float | None = None,
 ) -> np.ndarray:
     if not 0.0 < midline < 1.0:
         raise SplitterError(
@@ -179,6 +264,13 @@ def split_poster(
             400,
             "invalid_param",
             "spine_trim must be a float between 0 (inclusive) and 1 (exclusive).",
+        )
+
+    if target_ratio is not None and not 0.1 <= target_ratio <= 5.0:
+        raise SplitterError(
+            400,
+            "invalid_param",
+            "target_ratio must resolve to a width/height between 0.1 and 5.0.",
         )
 
     height, width = img.shape[:2]
@@ -196,7 +288,10 @@ def split_poster(
     else:
         chosen, chosen_side = pick_side(left, right)
 
-    return _trim_spine(chosen, chosen_side, spine_trim)
+    result = _trim_spine(chosen, chosen_side, spine_trim)
+    if target_ratio is not None:
+        result = _crop_to_ratio(result, target_ratio)
+    return result
 
 
 def encode_png(img: np.ndarray) -> bytes:
