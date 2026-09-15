@@ -9,7 +9,7 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, Response
 
 from app.fetcher import FetcherError, fetch_image
-from app.splitter import SplitterError, decode_image, encode_png, split_poster
+from app.splitter import SplitterError, decode_image, encode_png, parse_ratio, split_poster
 
 logger = logging.getLogger("poster_splitter")
 
@@ -61,6 +61,15 @@ async def poster(
             "between the two DVD panels. 0 disables trimming."
         ),
     ),
+    target_ratio: Optional[str] = Query(
+        None,
+        description=(
+            "Desired output aspect ratio as 'W:H' (e.g. '2:3') or a decimal "
+            "(e.g. '0.6667'). Center-crops the panel to this exact ratio "
+            "after spine trim. Only ever crops, never pads/upscales. "
+            "Omit to keep the natural split width."
+        ),
+    ),
 ) -> Response:
     if not url or not url.strip():
         return JSONResponse(
@@ -89,10 +98,27 @@ async def poster(
             },
         )
 
+    parsed_ratio: Optional[float] = None
+    if target_ratio is not None and target_ratio.strip():
+        try:
+            parsed_ratio = parse_ratio(target_ratio)
+        except SplitterError as exc:
+            return JSONResponse(status_code=exc.status_code, content=exc.as_dict())
+        if not 0.1 <= parsed_ratio <= 5.0:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "invalid_param",
+                    "detail": "target_ratio must resolve to a width/height between 0.1 and 5.0.",
+                },
+            )
+
     try:
         data = await fetch_image(url)
         img = decode_image(data)
-        cropped = split_poster(img, side=side, midline=midline, spine_trim=spine_trim)
+        cropped = split_poster(
+            img, side=side, midline=midline, spine_trim=spine_trim, target_ratio=parsed_ratio
+        )
         png_bytes = encode_png(cropped)
         return Response(content=png_bytes, media_type="image/png")
 
