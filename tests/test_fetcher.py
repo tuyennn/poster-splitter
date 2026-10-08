@@ -47,7 +47,17 @@ def test_literal_private_ip_rejected():
 
 
 class _Handler(BaseHTTPRequestHandler):
+    seen_headers: list = []
+    throttle_first = False
+
     def do_GET(self):
+        _Handler.seen_headers.append(dict(self.headers))
+        if _Handler.throttle_first and len(_Handler.seen_headers) == 1:
+            self.send_response(429)
+            self.send_header("Retry-After", "0")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if self.path == "/redirect":
             self.send_response(302)
             self.send_header("Location", "/img.png")
@@ -147,6 +157,57 @@ def test_https_keeps_hostname_for_sni_and_cert_check(loopback_allowed, tmp_path,
         assert data == PNG
     finally:
         server.shutdown()
+
+
+@pytest.fixture
+def local_server(loopback_allowed, monkeypatch):
+    """Local image server; FAKE_HOST always resolves to it (no rebinding)."""
+    real_gai = socket.getaddrinfo
+
+    def fake_gai(host, *args, **kwargs):
+        if host == FAKE_HOST:
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 0))]
+        return real_gai(host, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_gai)
+    _Handler.seen_headers = []
+    _Handler.throttle_first = False
+    server = _serve(ThreadingHTTPServer(("127.0.0.1", 0), _Handler))
+    yield f"http://{FAKE_HOST}:{server.server_address[1]}"
+    server.shutdown()
+
+
+def test_sends_browser_user_agent(local_server):
+    asyncio.run(fetcher.fetch_image(f"{local_server}/redirect"))
+    first, second = _Handler.seen_headers
+    assert first["User-Agent"] in fetcher.USER_AGENTS
+    assert "httpx" not in first["User-Agent"]
+    assert first["Accept"].startswith("image/")
+    assert first["Referer"] == f"{local_server}/"
+    # Same identity across a redirect.
+    assert second["User-Agent"] == first["User-Agent"]
+
+
+def test_user_agent_varies_between_fetches(local_server):
+    for _ in range(20):
+        asyncio.run(fetcher.fetch_image(f"{local_server}/img.png"))
+    assert len({h["User-Agent"] for h in _Handler.seen_headers}) > 1
+
+
+def test_retries_429_once_with_another_user_agent(local_server):
+    _Handler.throttle_first = True
+    assert asyncio.run(fetcher.fetch_image(f"{local_server}/img.png")) == PNG
+    first, second = _Handler.seen_headers
+    assert second["User-Agent"] != first["User-Agent"]
+
+
+@pytest.mark.parametrize(
+    "header, seconds",
+    [("2", 2.0), ("0", 0.0), ("600", fetcher.MAX_RETRY_AFTER), (None, 1.0),
+     ("Wed, 21 Oct 2026 07:28:00 GMT", 1.0), ("-3", 0.0)],
+)
+def test_retry_after_parsing(header, seconds):
+    assert fetcher._retry_after_seconds(header) == seconds
 
 
 def test_error_detail_does_not_leak_exception_text(monkeypatch):

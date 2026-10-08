@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import logging
+import random
 import socket
 
 import httpx
@@ -16,6 +17,28 @@ MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MB
 FETCH_TIMEOUT = 10.0  # per connect/read/write
 FETCH_DEADLINE = 30.0  # whole fetch, all redirects included
 MAX_REDIRECTS = 5
+# One retry on HTTP 429, waiting the server's Retry-After up to this long.
+MAX_RETRY_AFTER = 5.0
+
+# Some image hosts throttle or block non-browser clients (the default
+# "python-httpx/x.y" agent gets 429/403). Each fetch picks one of these at
+# random and keeps it across redirects; a 429 retry picks another.
+USER_AGENTS = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 Edg/140.0.0.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:143.0) Gecko/20100101 Firefox/143.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:143.0) Gecko/20100101 Firefox/143.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/26.0 Safari/605.1.15",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1",
+)
 
 # Normalize aliases for comparison
 CONTENT_TYPE_CANONICAL = {
@@ -155,7 +178,30 @@ def validate_url(url: str) -> httpx.URL:
     return parsed
 
 
-async def _open_pinned(client: httpx.AsyncClient, url: httpx.URL) -> httpx.Response:
+def _browser_headers(previous_agent: str | None = None) -> dict[str, str]:
+    """Headers a browser sends when loading an image, with a random
+    User-Agent (a different one from previous_agent, if given)."""
+    agents = [ua for ua in USER_AGENTS if ua != previous_agent] or list(USER_AGENTS)
+    return {
+        "User-Agent": random.choice(agents),
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+
+def _retry_after_seconds(header: str | None) -> float:
+    """Seconds to wait from a Retry-After header, capped at MAX_RETRY_AFTER.
+    HTTP-date values and junk fall back to 1 second."""
+    try:
+        seconds = float(header) if header is not None else 1.0
+    except ValueError:
+        seconds = 1.0
+    return min(max(seconds, 0.0), MAX_RETRY_AFTER)
+
+
+async def _open_pinned(
+    client: httpx.AsyncClient, url: httpx.URL, headers: dict[str, str]
+) -> httpx.Response:
     """Send GET for url, connecting to the IP address that was just checked.
 
     Letting httpx resolve the name again would open a DNS-rebinding hole:
@@ -168,7 +214,12 @@ async def _open_pinned(client: httpx.AsyncClient, url: httpx.URL) -> httpx.Respo
     request = client.build_request(
         "GET",
         url.copy_with(host=ip),
-        headers={"Host": url.netloc.decode("ascii")},
+        headers={
+            **headers,
+            "Host": url.netloc.decode("ascii"),
+            # Hotlink protection often wants a same-site Referer.
+            "Referer": f"{url.scheme}://{url.netloc.decode('ascii')}/",
+        },
         extensions=extensions,
     )
     return await client.send(request, stream=True)
@@ -192,9 +243,19 @@ async def fetch_image(url: str) -> bytes:
         # download so a server dripping one byte at a time can't hold a
         # request open indefinitely.
         async with asyncio.timeout(FETCH_DEADLINE), _new_client() as client:
-            for hop in range(MAX_REDIRECTS + 1):
-                response = await _open_pinned(client, target)
+            headers = _browser_headers()
+            hop = 0
+            retried = False
+            while True:
+                response = await _open_pinned(client, target, headers)
                 try:
+                    if response.status_code == 429 and not retried:
+                        retried = True
+                        delay = _retry_after_seconds(response.headers.get("retry-after"))
+                        await asyncio.sleep(delay)
+                        headers = _browser_headers(previous_agent=headers["User-Agent"])
+                        continue
+
                     if response.is_redirect:
                         if hop == MAX_REDIRECTS:
                             raise FetcherError(
@@ -210,6 +271,7 @@ async def fetch_image(url: str) -> bytes:
                         # Join against the original name, not the pinned IP;
                         # the next hop is validated and pinned the same way.
                         target = validate_url(str(target.join(location)))
+                        hop += 1
                         continue
 
                     if response.status_code < 200 or response.status_code >= 300:

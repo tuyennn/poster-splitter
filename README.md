@@ -112,6 +112,7 @@ Make sure only **one** OpenCV package is in `requirements.txt` (`opencv-python-h
 - Pixel cap (~40 megapixels), enforced by OpenCV from the image header before decoding (`OPENCV_IO_MAX_IMAGE_PIXELS`), so a tiny compressed "bomb" is never expanded
 - Image work runs in a thread pool, at most `MAX_CONCURRENT_JOBS` at a time, so one large poster doesn't stall other requests or `/health`
 - Fetch errors return a generic message; details go to the server log only
+- Fetches look like a browser loading an image: a random real-browser `User-Agent` (kept across redirects), image `Accept`, and a same-site `Referer`. A `429` is retried once with a different `User-Agent` after the server's `Retry-After` (capped at 5 s)
 - The Docker image runs as a non-root user
 - Aspect ratio gate: 0.45–0.95 is treated as a single cover, 0.95–2.2 as a double-poster, anything else is rejected
 - Any unexpected exception anywhere in the app is caught by a global handler, logged with a full traceback, and returned as a structured JSON `500` — never a bare error page
