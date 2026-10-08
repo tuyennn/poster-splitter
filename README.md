@@ -17,7 +17,9 @@ Stateless FastAPI service that fetches a landscape double-DVD combo poster, crop
 - **200** — `Content-Type: image/png` (cropped panel)
 - **400** — bad/missing URL, invalid image / MIME mismatch, invalid `midline` / `spine_trim` / `target_ratio`
 - **413** — file or decoded dimensions too large
-- **422** — aspect ratio is not a landscape double-poster
+- **422** — aspect ratio is neither a single cover nor a double-poster (see [Single covers](#single-covers))
+
+The response carries `X-Poster-Layout: single` or `double` so callers can tell which path ran.
 - **502** — could not fetch the source URL
 - **500** — unexpected server error (logged with full traceback server-side; response body is a generic JSON error, never a bare error page)
 
@@ -100,7 +102,7 @@ Make sure only **one** OpenCV package is in `requirements.txt` (`opencv-python-h
 - Dual MIME check: `Content-Type` header + magic-byte sniff
 - Streaming download with 10 MB hard cap
 - Decoded pixel cap (~40 megapixels)
-- Aspect ratio gate (~0.9–2.2) for double-poster layout
+- Aspect ratio gate: 0.45–0.95 is treated as a single cover, 0.95–2.2 as a double-poster, anything else is rejected
 - Any unexpected exception anywhere in the app is caught by a global handler, logged with a full traceback, and returned as a structured JSON `500` — never a bare error page
 
 ## Auto side selection (`side=auto`)
@@ -125,3 +127,7 @@ For a given request, the panel goes through, in order:
 2. **Select** a half (`side=left`/`right`/`auto`)
 3. **Spine trim** — remove `spine_trim` fraction off the half's inner edge
 4. **Ratio crop** (if `target_ratio` given) — center-crop to the exact requested aspect ratio
+
+## Single covers
+
+If the source image is already one portrait cover (width/height from `0.45` up to `0.95`) it is not split. `side`, `midline` and `spine_trim` are ignored, and the image is center-cropped to `target_ratio` if given, otherwise to the single-cover ratio `2:3`. The `0.95` boundary sits near the midpoint between one 2:3 cover (`0.67`) and two side by side (`1.33`), so an image is handled as whichever layout it is closer to.

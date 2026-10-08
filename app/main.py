@@ -9,7 +9,14 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, Response
 
 from app.fetcher import FetcherError, fetch_image
-from app.splitter import SplitterError, decode_image, encode_png, parse_ratio, split_poster
+from app.splitter import (
+    SplitterError,
+    classify_layout,
+    decode_image,
+    encode_png,
+    parse_ratio,
+    split_poster,
+)
 
 logger = logging.getLogger("poster_splitter")
 
@@ -17,7 +24,9 @@ app = FastAPI(
     title="Poster Splitter",
     description=(
         "Stateless service: fetch a landscape double-DVD combo poster, "
-        "crop one portrait panel, stream PNG bytes back. Nothing is written to disk."
+        "crop one portrait panel, stream PNG bytes back. A single portrait "
+        "cover is accepted too and cropped to the single-cover ratio. "
+        "Nothing is written to disk."
     ),
     version="1.0.0",
 )
@@ -116,11 +125,21 @@ async def poster(
     try:
         data = await fetch_image(url)
         img = decode_image(data)
+        layout = classify_layout(img)
         cropped = split_poster(
-            img, side=side, midline=midline, spine_trim=spine_trim, target_ratio=parsed_ratio
+            img,
+            side=side,
+            midline=midline,
+            spine_trim=spine_trim,
+            target_ratio=parsed_ratio,
+            layout=layout,
         )
         png_bytes = encode_png(cropped)
-        return Response(content=png_bytes, media_type="image/png")
+        return Response(
+            content=png_bytes,
+            media_type="image/png",
+            headers={"X-Poster-Layout": layout},
+        )
 
     except FetcherError as exc:
         return JSONResponse(status_code=exc.status_code, content=exc.as_dict())
