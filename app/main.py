@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse, Response
 from app.fetcher import FetcherError, fetch_image
 from app.splitter import (
     SplitterError,
+    classify_layout,
     decode_image,
     encode_png,
     load_detector,
@@ -42,7 +43,9 @@ app = FastAPI(
     title="Poster Splitter",
     description=(
         "Stateless service: fetch a landscape double-DVD combo poster, "
-        "crop one portrait panel, stream PNG bytes back. Nothing is written to disk."
+        "crop one portrait panel, stream PNG bytes back. A single portrait "
+        "cover is accepted too and cropped to the single-cover ratio. "
+        "Nothing is written to disk."
     ),
     version="1.0.0",
 )
@@ -66,12 +69,18 @@ def _render(
     midline: float,
     spine_trim: float,
     target_ratio: Optional[float],
-) -> bytes:
+) -> tuple[bytes, str]:
     img = decode_image(data)
+    layout = classify_layout(img)
     cropped = split_poster(
-        img, side=side, midline=midline, spine_trim=spine_trim, target_ratio=target_ratio
+        img,
+        side=side,
+        midline=midline,
+        spine_trim=spine_trim,
+        target_ratio=target_ratio,
+        layout=layout,
     )
-    return encode_png(cropped)
+    return encode_png(cropped), layout
 
 
 @app.get("/health")
@@ -160,10 +169,14 @@ async def poster(
         # Decode, detection and PNG encode are CPU-bound; running them on the
         # event loop would stall every other request (and /health) meanwhile.
         async with _job_slots:
-            png_bytes = await run_in_threadpool(
+            png_bytes, layout = await run_in_threadpool(
                 _render, data, side, midline, spine_trim, parsed_ratio
             )
-        return Response(content=png_bytes, media_type="image/png")
+        return Response(
+            content=png_bytes,
+            media_type="image/png",
+            headers={"X-Poster-Layout": layout},
+        )
 
     except FetcherError as exc:
         return JSONResponse(status_code=exc.status_code, content=exc.as_dict())

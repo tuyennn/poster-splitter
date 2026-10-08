@@ -80,7 +80,7 @@ def test_cpu_work_does_not_block_event_loop(monkeypatch):
 
     def slow_render(*args):
         time.sleep(1.0)
-        return png
+        return png, "double"
 
     monkeypatch.setattr(main, "fetch_image", fake_fetch)
     monkeypatch.setattr(main, "_render", slow_render)
