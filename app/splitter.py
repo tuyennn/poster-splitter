@@ -11,9 +11,17 @@ import cv2
 import numpy as np
 
 Side = Literal["left", "right", "auto"]
+Layout = Literal["single", "double"]
 
-# Landscape / near-square double-poster aspect range
-MIN_ASPECT = 0.9
+# Width/height of one portrait cover. Single-cover inputs are center-cropped
+# to this when the caller doesn't pass target_ratio.
+SINGLE_COVER_RATIO = 2 / 3
+
+# Aspect bands (width/height). Two 2:3 covers side by side make 4:3 (1.33),
+# one makes 0.67; SINGLE_MAX_ASPECT sits near the geometric midpoint (0.94)
+# so anything closer to one cover than to two is treated as a single cover.
+SINGLE_MIN_ASPECT = 0.45
+SINGLE_MAX_ASPECT = 0.95
 MAX_ASPECT = 2.2
 
 # Decompression-bomb guard (~40 megapixels)
@@ -53,7 +61,7 @@ def _get_yolo_net() -> cv2.dnn.Net:
 
 
 def decode_image(data: bytes) -> np.ndarray:
-    """Decode image bytes in memory; enforce megapixel + aspect checks."""
+    """Decode image bytes in memory; enforce the megapixel cap."""
     arr = np.frombuffer(data, dtype=np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img is None:
@@ -74,16 +82,25 @@ def decode_image(data: bytes) -> np.ndarray:
     if height == 0:
         raise SplitterError(400, "invalid_image", "Image has zero height.")
 
-    aspect = width / height
-    if aspect < MIN_ASPECT or aspect > MAX_ASPECT:
-        raise SplitterError(
-            422,
-            "invalid_aspect",
-            f"Image aspect ratio {aspect:.2f} is not a landscape double-poster "
-            f"(expected between {MIN_ASPECT} and {MAX_ASPECT}).",
-        )
-
     return img
+
+
+def classify_layout(img: np.ndarray) -> Layout:
+    """'double' for a two-cover combo, 'single' for one portrait cover;
+    422 for anything outside both aspect bands."""
+    height, width = img.shape[:2]
+    aspect = width / height
+    if SINGLE_MIN_ASPECT <= aspect < SINGLE_MAX_ASPECT:
+        return "single"
+    if SINGLE_MAX_ASPECT <= aspect <= MAX_ASPECT:
+        return "double"
+    raise SplitterError(
+        422,
+        "invalid_aspect",
+        f"Image aspect ratio {aspect:.2f} is neither a single cover "
+        f"({SINGLE_MIN_ASPECT}-{SINGLE_MAX_ASPECT}) nor a double-poster "
+        f"({SINGLE_MAX_ASPECT}-{MAX_ASPECT}).",
+    )
 
 
 def _largest_person_area(img: np.ndarray) -> float:
@@ -251,6 +268,7 @@ def split_poster(
     midline: float = 0.5,
     spine_trim: float = 0.0,
     target_ratio: float | None = None,
+    layout: Layout = "double",
 ) -> np.ndarray:
     if not 0.0 < midline < 1.0:
         raise SplitterError(
@@ -272,6 +290,11 @@ def split_poster(
             "invalid_param",
             "target_ratio must resolve to a width/height between 0.1 and 5.0.",
         )
+
+    if layout == "single":
+        # Already one cover: no midline split, no spine to trim — just bring
+        # it to the single-cover ratio (or the caller's target_ratio).
+        return _crop_to_ratio(img, target_ratio or SINGLE_COVER_RATIO)
 
     height, width = img.shape[:2]
     split_x = int(width * midline)
