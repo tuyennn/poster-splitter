@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
+import logging
 import socket
-from urllib.parse import urlparse
 
 import httpx
 import magic
 
+logger = logging.getLogger(__name__)
+
 MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MB
-FETCH_TIMEOUT = 10.0
+FETCH_TIMEOUT = 10.0  # per connect/read/write
+FETCH_DEADLINE = 30.0  # whole fetch, all redirects included
 MAX_REDIRECTS = 5
 
 # Normalize aliases for comparison
@@ -67,34 +71,50 @@ def _sniff_mime(data: bytes) -> str | None:
     return None
 
 
+_NAT64_PREFIX = ipaddress.IPv6Network("64:ff9b::/96")
+
+
 def _is_private_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    return (
-        ip.is_private
-        or ip.is_loopback
-        or ip.is_link_local
-        or ip.is_reserved
-        or ip.is_multicast
-        or ip.is_unspecified
-    )
+    # Unwrap IPv6 forms that carry an IPv4 address (::ffff:127.0.0.1, or the
+    # NAT64 prefix) so they get the IPv4 checks.
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
+        elif ip in _NAT64_PREFIX:
+            ip = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    # is_global also rules out shared/CGNAT space (100.64.0.0/10) and the
+    # other IANA special-purpose ranges that is_private misses.
+    return not ip.is_global or ip.is_multicast
 
 
-def _resolve_and_check_host(hostname: str) -> None:
-    """Resolve hostname and reject private/loopback/link-local addresses (SSRF)."""
+async def _resolve_public_ip(hostname: str) -> str:
+    """Resolve hostname once and return an address to connect to. Rejects
+    the host if ANY of its addresses is private/loopback/link-local (SSRF)."""
     try:
-        infos = socket.getaddrinfo(hostname, None)
-    except socket.gaierror as exc:
+        literal = ipaddress.ip_address(hostname)
+    except ValueError:
+        literal = None
+    if literal is not None:
+        if _is_private_ip(literal):
+            raise FetcherError(
+                400, "invalid_url", "URL targets a private or reserved IP address."
+            )
+        return hostname
+
+    try:
+        # The event loop's resolver runs in a thread, so a slow DNS server
+        # doesn't block other requests.
+        infos = await asyncio.get_running_loop().getaddrinfo(
+            hostname, None, type=socket.SOCK_STREAM
+        )
+    except (socket.gaierror, UnicodeError) as exc:
         raise FetcherError(
-            502,
-            "fetch_failed",
-            f"Could not resolve host: {hostname}",
+            502, "fetch_failed", f"Could not resolve host: {hostname}"
         ) from exc
 
-    if not infos:
-        raise FetcherError(502, "fetch_failed", f"Could not resolve host: {hostname}")
-
+    addresses: list[str] = []
     for info in infos:
-        sockaddr = info[4]
-        ip_str = sockaddr[0]
+        ip_str = info[4][0]
         try:
             ip = ipaddress.ip_address(ip_str)
         except ValueError:
@@ -105,16 +125,20 @@ def _resolve_and_check_host(hostname: str) -> None:
                 "invalid_url",
                 "URL resolves to a private or reserved IP address.",
             )
+        addresses.append(ip_str)
+
+    if not addresses:
+        raise FetcherError(502, "fetch_failed", f"Could not resolve host: {hostname}")
+    return addresses[0]
 
 
-def validate_url(url: str) -> str:
-    """Validate URL scheme/host and run SSRF IP checks. Returns the cleaned URL."""
+def validate_url(url: str) -> httpx.URL:
+    """Validate URL scheme and host (no network access)."""
     if not url or not url.strip():
         raise FetcherError(400, "invalid_url", "Missing required query parameter: url")
 
-    url = url.strip()
     try:
-        parsed = urlparse(url)
+        parsed = httpx.URL(url.strip())
     except Exception as exc:
         raise FetcherError(400, "invalid_url", "Malformed URL.") from exc
 
@@ -125,23 +149,35 @@ def validate_url(url: str) -> str:
             "Only http and https URLs are allowed.",
         )
 
-    if not parsed.hostname:
+    if not parsed.host:
         raise FetcherError(400, "invalid_url", "URL must include a hostname.")
 
-    # Reject literal private IPs in the URL itself
-    try:
-        ip = ipaddress.ip_address(parsed.hostname)
-        if _is_private_ip(ip):
-            raise FetcherError(
-                400,
-                "invalid_url",
-                "URL targets a private or reserved IP address.",
-            )
-    except ValueError:
-        # Hostname is not a literal IP — resolve and check
-        _resolve_and_check_host(parsed.hostname)
+    return parsed
 
-    return url
+
+async def _open_pinned(client: httpx.AsyncClient, url: httpx.URL) -> httpx.Response:
+    """Send GET for url, connecting to the IP address that was just checked.
+
+    Letting httpx resolve the name again would open a DNS-rebinding hole:
+    the first lookup could return a public IP and the second 127.0.0.1 or
+    169.254.169.254. So the URL is rewritten to the vetted IP, while the
+    Host header and TLS SNI/certificate check keep the original name."""
+    hostname = url.raw_host.decode("ascii")
+    ip = await _resolve_public_ip(hostname)
+    extensions = {"sni_hostname": hostname} if url.scheme == "https" else {}
+    request = client.build_request(
+        "GET",
+        url.copy_with(host=ip),
+        headers={"Host": url.netloc.decode("ascii")},
+        extensions=extensions,
+    )
+    return await client.send(request, stream=True)
+
+
+def _new_client() -> httpx.AsyncClient:
+    # trust_env=False: an HTTP(S)_PROXY from the environment would resolve
+    # the hostname itself and bypass the IP pinning above.
+    return httpx.AsyncClient(timeout=FETCH_TIMEOUT, follow_redirects=False, trust_env=False)
 
 
 async def fetch_image(url: str) -> bytes:
@@ -150,14 +186,15 @@ async def fetch_image(url: str) -> bytes:
     dual MIME validation (header + magic sniff), and SSRF guards.
     """
     try:
-        url = validate_url(url)
+        target = validate_url(url)
 
-        async with httpx.AsyncClient(
-            timeout=FETCH_TIMEOUT,
-            follow_redirects=False,
-        ) as client:
+        # FETCH_TIMEOUT applies per network operation; this caps the whole
+        # download so a server dripping one byte at a time can't hold a
+        # request open indefinitely.
+        async with asyncio.timeout(FETCH_DEADLINE), _new_client() as client:
             for hop in range(MAX_REDIRECTS + 1):
-                async with client.stream("GET", url) as response:
+                response = await _open_pinned(client, target)
+                try:
                     if response.is_redirect:
                         if hop == MAX_REDIRECTS:
                             raise FetcherError(
@@ -170,9 +207,9 @@ async def fetch_image(url: str) -> bytes:
                                 "fetch_failed",
                                 "Redirect response missing Location header.",
                             )
-                        # Resolve + SSRF-validate the NEXT hop's host
-                        # BEFORE we ever open a connection to it.
-                        url = validate_url(str(response.url.join(location)))
+                        # Join against the original name, not the pinned IP;
+                        # the next hop is validated and pinned the same way.
+                        target = validate_url(str(target.join(location)))
                         continue
 
                     if response.status_code < 200 or response.status_code >= 300:
@@ -221,30 +258,26 @@ async def fetch_image(url: str) -> bytes:
 
                     data = b"".join(chunks)
                     break
+                finally:
+                    await response.aclose()
 
     except FetcherError:
         raise
-    except httpx.TimeoutException as exc:
+    except (httpx.TimeoutException, TimeoutError) as exc:
         raise FetcherError(
             502,
             "fetch_failed",
             "Timed out while fetching the source URL.",
         ) from exc
-    except httpx.HTTPError as exc:
-        raise FetcherError(
-            502,
-            "fetch_failed",
-            f"Could not fetch the source URL: {exc}",
-        ) from exc
     except Exception as exc:
-        # Catches httpx exceptions that don't inherit from HTTPError
-        # (e.g. InvalidURL, CookieConflict, StreamConsumed/StreamClosed)
-        # plus any other unexpected failure during the fetch, so callers
-        # always get a structured FetcherError instead of a raw 500.
+        # httpx errors and anything else unexpected. The exception text can
+        # name internal hosts or library details, so it goes to the log, not
+        # to the client.
+        logger.warning("Fetch failed for %s: %r", url, exc)
         raise FetcherError(
             502,
             "fetch_failed",
-            f"Unexpected error while fetching the source URL: {exc}",
+            "Could not fetch the source URL.",
         ) from exc
 
     if not data:

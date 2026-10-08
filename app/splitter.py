@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from pathlib import Path
 from typing import Literal
 
 import cv2
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 Side = Literal["left", "right", "auto"]
 
@@ -16,17 +19,23 @@ Side = Literal["left", "right", "auto"]
 MIN_ASPECT = 0.9
 MAX_ASPECT = 2.2
 
-# Decompression-bomb guard (~40 megapixels)
+# Decompression-bomb guard (~40 megapixels). app/__init__.py also hands this
+# limit to OpenCV so it is enforced from the image header, before decoding.
 MAX_MEGAPIXELS = 40_000_000
 
 # --- YOLOv8n person detector (cv2.dnn, ONNX — no torch at runtime) ---
 YOLO_MODEL_PATH = os.environ.get(
     "YOLO_MODEL_PATH", str(Path(__file__).parent / "models" / "yolov8n.onnx")
 )
+# The bundled ONNX export has a fixed 1x3x640x640 input.
 YOLO_INPUT_SIZE = 640
 YOLO_CONF_THRESH = 0.4
 YOLO_NMS_THRESH = 0.45
 COCO_PERSON_CLASS_ID = 0
+
+# The visual-interest fallback only compares the two halves against each
+# other, so it runs on a downscaled copy instead of the full-size image.
+INTEREST_MAX_SIDE = 800
 
 
 class SplitterError(Exception):
@@ -41,21 +50,62 @@ class SplitterError(Exception):
 
 
 _yolo_net: cv2.dnn.Net | None = None
-_yolo_unavailable = False  # sticky flag once we've confirmed it's broken/missing
+_yolo_unavailable = False  # sticky only for load failures (missing/corrupt model)
+# cv2.dnn.Net is not safe for concurrent setInput()/forward() calls, and
+# requests now run in a thread pool. forward() is already multi-threaded
+# internally, so serialising calls costs little throughput.
+_yolo_lock = threading.Lock()
 
 
-def _get_yolo_net() -> cv2.dnn.Net:
-    global _yolo_net
-    if _yolo_net is None:
-        net = cv2.dnn.readNetFromONNX(YOLO_MODEL_PATH)
+def load_detector() -> bool:
+    """Load and warm up the person detector once. Returns False if the model
+    can't be used in this environment; the caller then falls back to the
+    visual-interest heuristic. Safe to call from several threads."""
+    global _yolo_net, _yolo_unavailable
+    if _yolo_net is not None:
+        return True
+    with _yolo_lock:
+        if _yolo_net is not None:
+            return True
+        if _yolo_unavailable:
+            return False
+        try:
+            net = cv2.dnn.readNetFromONNX(YOLO_MODEL_PATH)
+            # The first forward() pays for graph setup; do it here so the
+            # first real request doesn't.
+            net.setInput(np.zeros((1, 3, YOLO_INPUT_SIZE, YOLO_INPUT_SIZE), np.float32))
+            net.forward()
+        except Exception as exc:
+            # Missing/corrupt model file, opencv build without dnn support,
+            # bad ONNX opset, etc. This won't fix itself, so stop retrying.
+            logger.error(
+                "Person detection unavailable, falling back to visual-interest "
+                "heuristic for side='auto': %s",
+                exc,
+            )
+            _yolo_unavailable = True
+            return False
         _yolo_net = net
-    return _yolo_net
+        return True
 
 
 def decode_image(data: bytes) -> np.ndarray:
     """Decode image bytes in memory; enforce megapixel + aspect checks."""
     arr = np.frombuffer(data, dtype=np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    try:
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    except cv2.error as exc:
+        # Raised by OpenCV's OPENCV_IO_MAX_IMAGE_PIXELS check, from the image
+        # header, before any pixel buffer is allocated.
+        if "CV_IO_MAX_IMAGE_PIXELS" in str(exc):
+            raise SplitterError(
+                413,
+                "invalid_image",
+                f"Decoded image exceeds maximum of {MAX_MEGAPIXELS // 1_000_000} megapixels.",
+            ) from exc
+        raise SplitterError(
+            400, "invalid_image", "Content is not a valid JPEG/PNG/WEBP image."
+        ) from exc
     if img is None:
         raise SplitterError(
             400,
@@ -86,93 +136,86 @@ def decode_image(data: bytes) -> np.ndarray:
     return img
 
 
-def _largest_person_area(img: np.ndarray) -> float:
-    """Returns the area (px²) of the largest detected person, 0.0 if none
-    found, or -1.0 if the detector isn't usable in this environment."""
-    global _yolo_unavailable
-    if _yolo_unavailable:
-        return -1.0
+def _person_areas(img: np.ndarray, split_x: int) -> tuple[float, float] | None:
+    """Area (px²) of the largest detected person in each half, as
+    (left, right), with 0.0 for a half with nobody in it. Returns None if
+    the detector can't be used, so the caller falls back.
+
+    Runs one forward pass over the whole poster rather than one per half,
+    then clips each person box to the half (or halves) it falls in."""
+    if not load_detector():
+        return None
+
+    h, w = img.shape[:2]
+    scale = YOLO_INPUT_SIZE / max(h, w)
+    nh, nw = max(1, round(h * scale)), max(1, round(w * scale))
+    canvas = np.full((YOLO_INPUT_SIZE, YOLO_INPUT_SIZE, 3), 114, dtype=np.uint8)
+    canvas[:nh, :nw] = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
+    blob = cv2.dnn.blobFromImage(canvas, scalefactor=1 / 255.0, swapRB=True)
+
     try:
-        h, w = img.shape[:2]
-        scale = YOLO_INPUT_SIZE / max(h, w)
-        nh, nw = int(h * scale), int(w * scale)
-        resized = cv2.resize(img, (nw, nh))
-        canvas = np.full((YOLO_INPUT_SIZE, YOLO_INPUT_SIZE, 3), 114, dtype=np.uint8)
-        canvas[:nh, :nw] = resized
-
-        blob = cv2.dnn.blobFromImage(
-            canvas, scalefactor=1 / 255.0, size=(YOLO_INPUT_SIZE, YOLO_INPUT_SIZE), swapRB=True
-        )
-        net = _get_yolo_net()
-        net.setInput(blob)
-        out = net.forward()  # (1, 84, 8400)
-        out = out[0].T  # (8400, 84): [cx, cy, w, h, class0..class79]
-
-        boxes: list[list[float]] = []
-        scores: list[float] = []
-        class_scores = out[:, 4:]
-        class_ids = np.argmax(class_scores, axis=1)
-        confs = class_scores[np.arange(len(class_scores)), class_ids]
-        person_mask = (class_ids == COCO_PERSON_CLASS_ID) & (confs >= YOLO_CONF_THRESH)
-
-        for cx, cy, bw, bh in out[person_mask, :4]:
-            boxes.append([float(cx - bw / 2), float(cy - bh / 2), float(bw), float(bh)])
-        scores = [float(c) for c in confs[person_mask]]
-
-        if not boxes:
-            return 0.0
-
-        idxs = cv2.dnn.NMSBoxes(boxes, scores, YOLO_CONF_THRESH, YOLO_NMS_THRESH)
-        if len(idxs) == 0:
-            return 0.0
-
-        best_area = 0.0
-        for i in np.array(idxs).flatten():
-            bw, bh = boxes[i][2], boxes[i][3]
-            # boxes are in the 640x640 letterboxed space — undo scale to
-            # get area back in the original image's pixel space.
-            area = (bw / scale) * (bh / scale)
-            best_area = max(best_area, area)
-        return best_area
+        with _yolo_lock:
+            _yolo_net.setInput(blob)
+            out = _yolo_net.forward()  # (1, 84, 8400)
     except Exception as exc:
-        # Missing/corrupt model file, incompatible opencv build without dnn
-        # support, bad ONNX opset, etc. Don't fail every request over an
-        # optional heuristic — log once and fall back to visual-interest.
-        logging.getLogger(__name__).error(
-            "Person detection unavailable, falling back to visual-interest "
-            "heuristic for side='auto': %s",
-            exc,
-        )
-        _yolo_unavailable = True
-        return -1.0
+        # One odd image shouldn't switch detection off for every later
+        # request; fall back for this one only.
+        logger.warning("Person detection failed for this image, using fallback: %s", exc)
+        return None
+
+    preds = out[0].T  # (8400, 84): [cx, cy, w, h, class0..class79]
+    class_scores = preds[:, 4:]
+    person_conf = class_scores[:, COCO_PERSON_CLASS_ID]
+    mask = (person_conf >= YOLO_CONF_THRESH) & (
+        class_scores.argmax(axis=1) == COCO_PERSON_CLASS_ID
+    )
+    if not mask.any():
+        return 0.0, 0.0
+
+    # Letterboxed 640x640 space -> original image pixels.
+    cx, cy, bw, bh = (preds[mask, :4] / scale).T
+    boxes = np.stack([cx - bw / 2, cy - bh / 2, bw, bh], axis=1)
+    keep = cv2.dnn.NMSBoxes(
+        boxes.tolist(), person_conf[mask].tolist(), YOLO_CONF_THRESH, YOLO_NMS_THRESH
+    )
+    if len(keep) == 0:
+        return 0.0, 0.0
+
+    x0, y0, bw, bh = boxes[np.asarray(keep).flatten()].T
+    x1, y1 = x0 + bw, y0 + bh
+    box_h = np.clip(np.minimum(y1, h) - np.maximum(y0, 0), 0, None)
+    left_w = np.clip(np.minimum(x1, split_x) - np.maximum(x0, 0), 0, None)
+    right_w = np.clip(np.minimum(x1, w) - np.maximum(x0, split_x), 0, None)
+    return float((left_w * box_h).max()), float((right_w * box_h).max())
 
 
-def _visual_interest(img: np.ndarray) -> float:
+def _visual_interest(gray: np.ndarray) -> float:
     """Edge density + Laplacian variance — prefer art over blank spine/margin."""
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray, 50, 150)
     edge_density = float(np.count_nonzero(edges)) / edges.size
     lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
     return edge_density * 1000.0 + lap_var
 
 
-def pick_side(left: np.ndarray, right: np.ndarray) -> tuple[np.ndarray, Literal["left", "right"]]:
-    left_area = _largest_person_area(left)
-    right_area = _largest_person_area(right)
+def pick_side(img: np.ndarray, split_x: int) -> Literal["left", "right"]:
+    """Pick the half with the biggest person in it, or the busier half if
+    nobody is detected on either side (or detection is unavailable)."""
+    areas = _person_areas(img, split_x)
+    if areas is not None and max(areas) > 0.0:
+        return "left" if areas[0] >= areas[1] else "right"
 
-    if left_area > 0.0 or right_area > 0.0:
-        # At least one side has a detected person — prefer whichever side's
-        # biggest person is larger (a -1 "unavailable" side loses to any
-        # real, even small, detection).
-        if left_area >= right_area:
-            return left, "left"
-        return right, "right"
-
-    # No people detected on either side (or detection is unavailable) →
-    # visual interest fallback.
-    if _visual_interest(left) >= _visual_interest(right):
-        return left, "left"
-    return right, "right"
+    h, w = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    factor = min(1.0, INTEREST_MAX_SIDE / max(h, w))
+    if factor < 1.0:
+        gray = cv2.resize(
+            gray, (max(2, round(w * factor)), max(1, round(h * factor))),
+            interpolation=cv2.INTER_AREA,
+        )
+    gx = min(max(1, round(split_x * factor)), gray.shape[1] - 1)
+    if _visual_interest(gray[:, :gx]) >= _visual_interest(gray[:, gx:]):
+        return "left"
+    return "right"
 
 
 def _trim_spine(img: np.ndarray, side: Literal["left", "right"], spine_trim: float) -> np.ndarray:
@@ -286,7 +329,8 @@ def split_poster(
     elif side == "right":
         chosen, chosen_side = right, "right"
     else:
-        chosen, chosen_side = pick_side(left, right)
+        chosen_side = pick_side(img, split_x)
+        chosen = left if chosen_side == "left" else right
 
     result = _trim_spine(chosen, chosen_side, spine_trim)
     if target_ratio is not None:

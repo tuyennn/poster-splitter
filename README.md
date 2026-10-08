@@ -92,30 +92,42 @@ pip install -r requirements.txt
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
+Tests:
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
 Make sure only **one** OpenCV package is in `requirements.txt` (`opencv-python-headless` is the right one for a headless server). Having both `opencv-python` and `opencv-python-headless` installed at once corrupts the `cv2` module and breaks detection at runtime with errors like `AttributeError: module 'cv2' has no attribute 'CascadeClassifier'`.
 
 ## Safeguards
 
-- SSRF: rejects private / loopback / link-local IPs, both on the original URL and on **every redirect hop** — hops are walked and validated manually (not via httpx's built-in `follow_redirects`) so a malicious redirect target is never connected to
+- SSRF: rejects any address that isn't globally routable (private, loopback, link-local, CGNAT, IPv4-mapped IPv6, …), both on the original URL and on **every redirect hop** — hops are walked and validated manually (not via httpx's built-in `follow_redirects`) so a malicious redirect target is never connected to
+- DNS rebinding: each host is resolved once and the connection goes to that vetted IP (Host header and TLS SNI/certificate check still use the hostname), so a second, different DNS answer is never used. Proxy environment variables are ignored for the same reason
 - Dual MIME check: `Content-Type` header + magic-byte sniff
-- Streaming download with 10 MB hard cap
-- Decoded pixel cap (~40 megapixels)
+- Streaming download with 10 MB hard cap and a 30 s deadline for the whole fetch
+- Pixel cap (~40 megapixels), enforced by OpenCV from the image header before decoding (`OPENCV_IO_MAX_IMAGE_PIXELS`), so a tiny compressed "bomb" is never expanded
+- Image work runs in a thread pool, at most `MAX_CONCURRENT_JOBS` at a time, so one large poster doesn't stall other requests or `/health`
+- Fetch errors return a generic message; details go to the server log only
+- The Docker image runs as a non-root user
 - Aspect ratio gate (~0.9–2.2) for double-poster layout
 - Any unexpected exception anywhere in the app is caught by a global handler, logged with a full traceback, and returned as a structured JSON `500` — never a bare error page
 
 ## Auto side selection (`side=auto`)
 
-1. Run YOLOv8n person detection (via `cv2.dnn`, ONNX — no `torch` at runtime) on each half
+1. Run YOLOv8n person detection (via `cv2.dnn`, ONNX — no `torch` at runtime) once over the whole poster, then clip each person box to the half it falls in
 2. Pick the half whose **largest detected person** has the bigger bounding-box area
 3. If neither half has a detected person (or the detector is unavailable — e.g. missing model file), fall back to a visual-interest heuristic: Canny edge density + Laplacian variance
 
-Requires the model file at `app/models/yolov8n.onnx` (or wherever `YOLO_MODEL_PATH` points — see below). If missing or unreadable, detection degrades gracefully to the visual-interest fallback rather than failing the request.
+Requires the model file at `app/models/yolov8n.onnx` (or wherever `YOLO_MODEL_PATH` points — see below). The model is loaded and warmed up at startup. If it's missing or unreadable, detection degrades gracefully to the visual-interest fallback rather than failing the request. If inference fails on one image, only that request falls back.
 
 ### Environment variables
 
 | Var               | Default                    | Description                              |
 |-------------------|-----------------------------|-------------------------------------------|
 | `YOLO_MODEL_PATH` | `app/models/yolov8n.onnx`  | Path to the ONNX person-detection model  |
+| `MAX_CONCURRENT_JOBS` | CPU count | Posters decoded/split/encoded at once (bounds CPU and memory) |
 
 ## Cropping pipeline
 
