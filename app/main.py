@@ -18,7 +18,6 @@ from app.splitter import (
     classify_layout,
     decode_image,
     encode_png,
-    load_detector,
     load_face_detector,
     parse_ratio,
     split_poster,
@@ -34,9 +33,8 @@ _job_slots = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    # Load and warm the detectors before taking traffic, off the event loop.
+    # Load and warm the face detector before taking traffic, off the event loop.
     await run_in_threadpool(load_face_detector)
-    await run_in_threadpool(load_detector)
     yield
 
 
@@ -96,10 +94,10 @@ async def poster(
         None, description="Full-size source image URL to split"
     ),
     side: Literal["left", "right", "auto"] = Query(
-        "right",
+        "auto",
         description=(
             "Which half to return: left, right, or auto (the half with the "
-            "largest detected person, else the more detailed half)"
+            "largest detected face, else the right half)"
         ),
     ),
     midline: float = Query(

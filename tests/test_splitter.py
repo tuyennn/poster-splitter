@@ -30,46 +30,48 @@ def _poster(busy_side):
 
 
 @pytest.mark.parametrize("busy_side", ["left", "right"])
-def test_auto_falls_back_to_busier_half(busy_side):
-    assert splitter.pick_side(_poster(busy_side), 400) == busy_side
+def test_auto_without_face_returns_right(busy_side):
+    assert splitter.pick_side(_poster(busy_side), 400) == "right"
 
 
-def test_detection_failure_is_not_sticky(monkeypatch):
-    assert splitter.load_detector()
-    real_net = splitter._yolo_net
+def test_face_detection_failure_is_not_sticky(monkeypatch):
+    assert splitter.load_face_detector()
+    real_det = splitter._face_det
 
     class Broken:
-        def setInput(self, blob):
+        def setInputSize(self, size):
             pass
 
-        def forward(self):
+        def detect(self, img):
             raise RuntimeError("bad input")
 
-    monkeypatch.setattr(splitter, "_yolo_net", Broken())
-    assert splitter._person_areas(_poster("left"), 400) is None
-    monkeypatch.setattr(splitter, "_yolo_net", real_net)
-    assert splitter._person_areas(_poster("left"), 400) == (0.0, 0.0)
+    monkeypatch.setattr(splitter, "_face_det", Broken())
+    assert splitter._face_areas(_poster("left"), 400) is None
+    assert splitter.pick_side(_poster("left"), 400) == "right"
+    monkeypatch.setattr(splitter, "_face_det", real_det)
+    assert splitter._face_areas(_poster("left"), 400) == (0.0, 0.0)
 
 
-def test_person_box_is_clipped_to_each_half(monkeypatch):
-    # One fake detection: a 100x200 box (in 640 space) centred on x=300,
-    # i.e. straddling the split at x=320 of an 800x800 image (scale 0.8).
-    out = np.zeros((1, 84, 8400), np.float32)
-    out[0, :4, 0] = [300, 300, 100, 200]
-    out[0, 4, 0] = 0.9
+def test_side_defaults_to_auto(monkeypatch):
+    seen = {}
 
-    class Fake:
-        def setInput(self, blob):
-            pass
+    async def fake_fetch(url):
+        return cv2.imencode(".png", _poster("left"))[1].tobytes()
 
-        def forward(self):
-            return out
+    def fake_render(data, side, *args):
+        seen["side"] = side
+        return b"png", "double"
 
-    monkeypatch.setattr(splitter, "_yolo_net", Fake())
-    left, right = splitter._person_areas(np.zeros((800, 800, 3), np.uint8), 400)
-    # Box spans x 312.5..437.5, height 250 in original pixels.
-    assert left == pytest.approx(87.5 * 250)
-    assert right == pytest.approx(37.5 * 250)
+    monkeypatch.setattr(main, "fetch_image", fake_fetch)
+    monkeypatch.setattr(main, "_render", fake_render)
+
+    async def run():
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            return await client.get("/poster", params={"url": "http://x/a.png"})
+
+    assert asyncio.run(run()).status_code == 200
+    assert seen["side"] == "auto"
 
 
 def test_cpu_work_does_not_block_event_loop(monkeypatch):
