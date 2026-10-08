@@ -9,7 +9,7 @@ Stateless FastAPI service that fetches a landscape double-DVD combo poster, crop
 | Param          | Required | Default | Description                                                                                                                    |
 |----------------|----------|---------|------------------------------------------------------------------------------------------------------------------------------------|
 | `url`          | yes      | —       | Source image URL (`http` / `https`)                                                                                              |
-| `side`         | no       | `auto`  | `left` \| `right` \| `auto` (largest detected person, else visual-interest heuristic)                                            |
+| `side`         | no       | `right` | `left` \| `right` \| `auto` (largest detected face, else largest person, else visual-interest heuristic)                         |
 | `midline`      | no       | `0.5`   | Vertical split position as a fraction of width (`0`–`1`, exclusive)                                                              |
 | `spine_trim`   | no       | `0.02`  | Fraction of the returned half's width to trim off its inner edge (nearest the midline), to drop the spine/gutter divider. `0` disables it. |
 | `target_ratio` | no       | — (off) | Desired output aspect ratio as `W:H` (e.g. `2:3`) or a decimal (e.g. `0.6667`). Center-crops the panel to this exact ratio after spine trim. Only ever crops — never pads or upscales. |
@@ -119,16 +119,17 @@ Make sure only **one** OpenCV package is in `requirements.txt` (`opencv-python-h
 
 ## Auto side selection (`side=auto`)
 
-1. Run YOLOv8n person detection (via `cv2.dnn`, ONNX — no `torch` at runtime) once over the whole poster, then clip each person box to the half it falls in
-2. Pick the half whose **largest detected person** has the bigger bounding-box area
-3. If neither half has a detected person (or the detector is unavailable — e.g. missing model file), fall back to a visual-interest heuristic: Canny edge density + Laplacian variance
+1. Run YuNet face detection (`cv2.FaceDetectorYN`, ONNX) once over the whole poster. If any face is found, pick the half holding the **largest face** (by the face's centre)
+2. Otherwise run YOLOv8n person detection (via `cv2.dnn`, ONNX — no `torch` at runtime) once over the whole poster, clip each person box to the half it falls in, and pick the half whose **largest detected person** has the bigger bounding-box area
+3. If neither half has a face or a person (or the detectors are unavailable — e.g. missing model file), fall back to a visual-interest heuristic: Canny edge density + Laplacian variance
 
-Requires the model file at `app/models/yolov8n.onnx` (or wherever `YOLO_MODEL_PATH` points — see below). The model is loaded and warmed up at startup. If it's missing or unreadable, detection degrades gracefully to the visual-interest fallback rather than failing the request. If inference fails on one image, only that request falls back.
+Requires the model files at `app/models/face_detection_yunet_2023mar.onnx` and `app/models/yolov8n.onnx` (or wherever `FACE_MODEL_PATH` / `YOLO_MODEL_PATH` point — see below). Both are loaded and warmed up at startup. If it's missing or unreadable, detection degrades gracefully to the visual-interest fallback rather than failing the request. If inference fails on one image, only that request falls back.
 
 ### Environment variables
 
 | Var               | Default                    | Description                              |
 |-------------------|-----------------------------|-------------------------------------------|
+| `FACE_MODEL_PATH` | `app/models/face_detection_yunet_2023mar.onnx` | Path to the YuNet ONNX face-detection model (MIT, from opencv_zoo) |
 | `YOLO_MODEL_PATH` | `app/models/yolov8n.onnx`  | Path to the ONNX person-detection model  |
 | `MAX_CONCURRENT_JOBS` | CPU count | Posters decoded/split/encoded at once (bounds CPU and memory) |
 

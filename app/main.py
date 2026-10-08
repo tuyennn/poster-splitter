@@ -19,6 +19,7 @@ from app.splitter import (
     decode_image,
     encode_png,
     load_detector,
+    load_face_detector,
     parse_ratio,
     split_poster,
 )
@@ -33,7 +34,8 @@ _job_slots = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    # Load and warm the detector before taking traffic, off the event loop.
+    # Load and warm the detectors before taking traffic, off the event loop.
+    await run_in_threadpool(load_face_detector)
     await run_in_threadpool(load_detector)
     yield
 

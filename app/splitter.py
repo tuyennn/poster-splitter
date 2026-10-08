@@ -41,6 +41,19 @@ YOLO_CONF_THRESH = 0.4
 YOLO_NMS_THRESH = 0.45
 COCO_PERSON_CLASS_ID = 0
 
+# --- YuNet face detector (cv2.FaceDetectorYN, ONNX) ---
+# A visible face is the strongest "this is the cover art" signal, so it is
+# checked before whole-person boxes.
+FACE_MODEL_PATH = os.environ.get(
+    "FACE_MODEL_PATH",
+    str(Path(__file__).parent / "models" / "face_detection_yunet_2023mar.onnx"),
+)
+FACE_CONF_THRESH = 0.6
+FACE_NMS_THRESH = 0.3
+# Faces are detected on a copy downscaled to this longest side; a face
+# smaller than ~10px there is too small to matter for picking a cover.
+FACE_MAX_SIDE = 960
+
 # The visual-interest fallback only compares the two halves against each
 # other, so it runs on a downscaled copy instead of the full-size image.
 INTEREST_MAX_SIDE = 800
@@ -63,6 +76,10 @@ _yolo_unavailable = False  # sticky only for load failures (missing/corrupt mode
 # requests now run in a thread pool. forward() is already multi-threaded
 # internally, so serialising calls costs little throughput.
 _yolo_lock = threading.Lock()
+
+_face_det: cv2.FaceDetectorYN | None = None
+_face_unavailable = False
+_face_lock = threading.Lock()  # FaceDetectorYN holds per-call input size
 
 
 def load_detector() -> bool:
@@ -94,6 +111,30 @@ def load_detector() -> bool:
             _yolo_unavailable = True
             return False
         _yolo_net = net
+        return True
+
+
+def load_face_detector() -> bool:
+    """Load the face detector once. Returns False if it can't be used; the
+    caller then goes straight to person detection."""
+    global _face_det, _face_unavailable
+    if _face_det is not None:
+        return True
+    with _face_lock:
+        if _face_det is not None:
+            return True
+        if _face_unavailable:
+            return False
+        try:
+            det = cv2.FaceDetectorYN.create(
+                FACE_MODEL_PATH, "", (320, 320), FACE_CONF_THRESH, FACE_NMS_THRESH
+            )
+            det.detect(np.zeros((320, 320, 3), np.uint8))  # warm-up
+        except Exception as exc:
+            logger.error("Face detection unavailable for side='auto': %s", exc)
+            _face_unavailable = True
+            return False
+        _face_det = det
         return True
 
 
@@ -206,6 +247,39 @@ def _person_areas(img: np.ndarray, split_x: int) -> tuple[float, float] | None:
     return float((left_w * box_h).max()), float((right_w * box_h).max())
 
 
+def _face_areas(img: np.ndarray, split_x: int) -> tuple[float, float] | None:
+    """Area (px²) of the largest face in each half, as (left, right), with
+    0.0 for a half with no face. Each face counts for the half its centre is
+    in. Returns None if the detector can't be used."""
+    if not load_face_detector():
+        return None
+
+    h, w = img.shape[:2]
+    factor = min(1.0, FACE_MAX_SIDE / max(h, w))
+    small = img
+    if factor < 1.0:
+        small = cv2.resize(
+            img, (max(1, round(w * factor)), max(1, round(h * factor))),
+            interpolation=cv2.INTER_AREA,
+        )
+    try:
+        with _face_lock:
+            _face_det.setInputSize((small.shape[1], small.shape[0]))
+            _, faces = _face_det.detect(small)
+    except Exception as exc:
+        logger.warning("Face detection failed for this image, skipping it: %s", exc)
+        return None
+    if faces is None or len(faces) == 0:
+        return 0.0, 0.0
+
+    x, fw, fh = faces[:, 0] / factor, faces[:, 2] / factor, faces[:, 3] / factor
+    area = fw * fh
+    on_left = (x + fw / 2) < split_x
+    left = float(area[on_left].max()) if on_left.any() else 0.0
+    right = float(area[~on_left].max()) if (~on_left).any() else 0.0
+    return left, right
+
+
 def _visual_interest(gray: np.ndarray) -> float:
     """Edge density + Laplacian variance — prefer art over blank spine/margin."""
     edges = cv2.Canny(gray, 50, 150)
@@ -215,8 +289,12 @@ def _visual_interest(gray: np.ndarray) -> float:
 
 
 def pick_side(img: np.ndarray, split_x: int) -> Literal["left", "right"]:
-    """Pick the half with the biggest person in it, or the busier half if
-    nobody is detected on either side (or detection is unavailable)."""
+    """Pick the half with the biggest face in it; failing that, the half
+    with the biggest person; failing that, the busier half."""
+    faces = _face_areas(img, split_x)
+    if faces is not None and max(faces) > 0.0:
+        return "left" if faces[0] >= faces[1] else "right"
+
     areas = _person_areas(img, split_x)
     if areas is not None and max(areas) > 0.0:
         return "left" if areas[0] >= areas[1] else "right"
