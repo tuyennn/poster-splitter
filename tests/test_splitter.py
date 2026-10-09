@@ -31,7 +31,9 @@ def _poster(busy_side):
 
 @pytest.mark.parametrize("busy_side", ["left", "right"])
 def test_auto_without_face_returns_right(busy_side):
-    assert splitter.pick_side(_poster(busy_side), 400) == "right"
+    poster = _poster(busy_side)
+    out = splitter.split_poster(poster, side="auto")
+    assert np.array_equal(out, poster[:, 400:])
 
 
 def test_face_detection_failure_is_not_sticky(monkeypatch):
@@ -46,10 +48,10 @@ def test_face_detection_failure_is_not_sticky(monkeypatch):
             raise RuntimeError("bad input")
 
     monkeypatch.setattr(splitter, "_face_det", Broken())
-    assert splitter._face_areas(_poster("left"), 400) is None
-    assert splitter.pick_side(_poster("left"), 400) == "right"
+    assert splitter._detect_faces(_poster("left")) is None
+    assert np.array_equal(splitter.split_poster(_poster("left")), _poster("left")[:, 400:])
     monkeypatch.setattr(splitter, "_face_det", real_det)
-    assert splitter._face_areas(_poster("left"), 400) == (0.0, 0.0)
+    assert len(splitter._detect_faces(_poster("left"))) == 0
 
 
 def test_side_defaults_to_auto(monkeypatch):
