@@ -47,39 +47,29 @@ def _cover_of(poster, x):
     return "left" if x < poster.shape[1] / 2 else "right"
 
 
-def _crop_x0(poster, out):
-    """Where `out` (a full-height crop of `poster`) starts."""
-    for x0 in range(poster.shape[1] - out.shape[1] + 1):
-        if np.array_equal(poster[:, x0 : x0 + out.shape[1]], out):
-            return x0
-    raise AssertionError("output is not a crop of the poster")
-
-
-def _assert_face_centred(poster, face_side):
+def _assert_returns_half(poster, face_side):
     centre = splitter.largest_face_center(poster)
     assert centre is not None and _cover_of(poster, centre[0]) == face_side
     out = splitter.split_poster(poster, side="auto")
-    assert out.shape[:2] == (H, COVER_W)  # one 2:3 cover, not split at the midline
-    x0 = _crop_x0(poster, out)
-    want = int(max(0, min(poster.shape[1] - COVER_W, round(centre[0] - COVER_W / 2))))
-    assert x0 == want
+    half = poster[:, :COVER_W] if face_side == "left" else poster[:, COVER_W:]
+    assert np.array_equal(out, half)
 
 
 @pytest.mark.parametrize("face_side", ["left", "right"])
-def test_auto_crops_around_the_only_face(face_side):
+def test_auto_returns_the_half_with_the_face(face_side):
     covers = [person_cover(), busy_cover()]
     if face_side == "right":
         covers.reverse()
-    _assert_face_centred(np.hstack(covers), face_side)
+    _assert_returns_half(np.hstack(covers), face_side)
 
 
 @pytest.mark.parametrize("face_side", ["left", "right"])
 def test_face_beats_bigger_faceless_person(face_side):
-    # A big person with no visible face must not pull the crop.
+    # A big person with no visible face must not win.
     covers = [small_person_cover(), faceless_person_cover()]
     if face_side == "right":
         covers.reverse()
-    _assert_face_centred(np.hstack(covers), face_side)
+    _assert_returns_half(np.hstack(covers), face_side)
 
 
 def test_face_detection_works_on_large_poster():
@@ -96,7 +86,7 @@ def test_bigger_face_wins(big_side):
         covers.reverse()
     poster = np.hstack(covers)
     assert len(splitter._detect_faces(poster)) == 2  # both faces found
-    _assert_face_centred(poster, big_side)
+    _assert_returns_half(poster, big_side)
 
 
 def test_face_in_the_middle_of_a_double_ratio_photo():
@@ -109,6 +99,31 @@ def test_face_in_the_middle_of_a_double_ratio_photo():
     out = splitter.split_poster(poster, side="auto")
     assert out.shape[:2] == (H, COVER_W)
     assert abs(_face_x_in(out) - COVER_W / 2) < 8
+
+
+@pytest.mark.parametrize("offset", [-200, 200])
+def test_face_inside_one_cover_near_the_middle_still_splits(offset):
+    # Face clear of the cut (midline + spine trim): return its whole cover.
+    photo = cv2.resize(PHOTO, (H, H))
+    poster = np.full((H, 2 * COVER_W, 3), 90, np.uint8)
+    face_x = splitter.largest_face_center(photo)[0]
+    x = int(round(COVER_W + offset - face_x))
+    xs, xe = max(0, x), min(poster.shape[1], x + H)
+    poster[:, xs:xe] = photo[:, xs - x : xe - x]
+    side = "left" if offset < 0 else "right"
+    out = splitter.split_poster(poster, side="auto", spine_trim=0.05)
+    trim = int(round(COVER_W * 0.05))
+    want = poster[:, : COVER_W - trim] if side == "left" else poster[:, COVER_W + trim :]
+    assert np.array_equal(out, want)
+
+
+def test_face_hits_cut():
+    # 1000 wide, split at 500, 5% trim -> cut strip is 475..525.
+    assert splitter._face_hits_cut((480, 0, 40, 40), 1000, 500, 0.05)
+    assert splitter._face_hits_cut((430, 0, 50, 50), 1000, 500, 0.05)  # ends at 480
+    assert not splitter._face_hits_cut((420, 0, 50, 50), 1000, 500, 0.05)  # ends at 470
+    assert not splitter._face_hits_cut((530, 0, 50, 50), 1000, 500, 0.05)
+    assert not splitter._face_hits_cut((450, 0, 50, 50), 1000, 500, 0.0)  # touches line
 
 
 def test_explicit_side_still_splits():
