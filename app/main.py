@@ -44,7 +44,8 @@ app = FastAPI(
     description=(
         "Stateless service: fetch a landscape double-DVD combo poster, "
         "crop one portrait panel, stream PNG bytes back. A single portrait "
-        "cover is accepted too and cropped to the single-cover ratio. "
+        "cover (any non double-poster ratio) is cropped to the single-cover "
+        "ratio around the largest face. "
         "Nothing is written to disk."
     ),
     version="1.0.0",

@@ -102,3 +102,52 @@ def test_missing_model_returns_right(monkeypatch):
     assert not splitter.load_face_detector()
     assert splitter._face_areas(poster, COVER_W) is None
     assert splitter.pick_side(poster, COVER_W) == "right"
+
+
+def _canvas(w, h):
+    return np.full((h, w, 3), 90, np.uint8)
+
+
+def _face_x_in(out):
+    faces = splitter._detect_faces(out)
+    assert faces is not None and len(faces) > 0
+    x, _, fw, _ = faces[int(np.argmax(faces[:, 2] * faces[:, 3]))]
+    return x + fw / 2
+
+
+def test_single_cover_crops_around_biggest_face():
+    # A 3:1 banner: not a double-poster ratio, so it is handled as one cover.
+    # The big face sits near the centre; a smaller one is at the far left.
+    banner = _canvas(1536, 512)
+    banner[:, 640:1152] = PHOTO
+    banner[128:384, 0:256] = cv2.resize(PHOTO, (256, 256))
+    assert splitter.classify_layout(banner) == "single"
+
+    out = splitter.split_poster(banner, layout="single")
+    assert out.shape[:2] == (512, 341)  # 2:3, full height
+    # The big face is centred in the output (within a few pixels).
+    assert abs(_face_x_in(out) - 341 / 2) < 8
+
+
+def test_single_cover_follows_face_off_centre():
+    # Face high up in a tall image: a plain centre crop would cut it off.
+    tall = _canvas(512, 1100)
+    tall[:512] = PHOTO
+    out = splitter.split_poster(tall, layout="single")
+    assert out.shape[:2] == (768, 512)
+    assert np.array_equal(out, tall[:768])  # window clamped to the top edge
+    assert splitter._detect_faces(out).shape[0] == 1
+
+
+def test_single_cover_target_ratio_centres_on_face():
+    banner = _canvas(1536, 512)
+    banner[:, 300:812] = PHOTO  # face centre at x ~523
+    out = splitter.split_poster(banner, layout="single", target_ratio=0.5)
+    assert out.shape[:2] == (512, 256)
+    assert abs(_face_x_in(out) - 128) < 8
+
+
+def test_single_cover_without_face_is_centre_cropped():
+    banner = (np.random.default_rng(1).random((300, 1200, 3)) * 255).astype(np.uint8)
+    out = splitter.split_poster(banner, layout="single")
+    assert np.array_equal(out, banner[:, 500:700])

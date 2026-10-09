@@ -17,7 +17,6 @@ Stateless FastAPI service that fetches a landscape double-DVD combo poster, crop
 - **200** — `Content-Type: image/png` (cropped panel)
 - **400** — bad/missing URL, invalid image / MIME mismatch, invalid `midline` / `spine_trim` / `target_ratio`
 - **413** — file or decoded dimensions too large
-- **422** — aspect ratio is neither a single cover nor a double-poster (see [Single covers](#single-covers))
 
 The response carries `X-Poster-Layout: single` or `double` so callers can tell which path ran.
 - **502** — could not fetch the source URL
@@ -114,7 +113,7 @@ Make sure only **one** OpenCV package is in `requirements.txt` (`opencv-python-h
 - Fetch errors return a generic message; details go to the server log only
 - Fetches look like a browser loading an image: a random real-browser `User-Agent` (kept across redirects), image `Accept`, and a same-site `Referer`. A `429` is retried once with a different `User-Agent` after the server's `Retry-After` (capped at 5 s)
 - The Docker image runs as a non-root user
-- Aspect ratio gate: 0.45–0.95 is treated as a single cover, 0.95–2.2 as a double-poster, anything else is rejected
+- Aspect ratio gate: 0.95–2.2 is treated as a double-poster; any other ratio is handled as a single cover
 - Any unexpected exception anywhere in the app is caught by a global handler, logged with a full traceback, and returned as a structured JSON `500` — never a bare error page
 
 ## Auto side selection (`side=auto`)
@@ -144,4 +143,4 @@ For a given request, the panel goes through, in order:
 
 ## Single covers
 
-If the source image is already one portrait cover (width/height from `0.45` up to `0.95`) it is not split. `side`, `midline` and `spine_trim` are ignored, and the image is center-cropped to `target_ratio` if given, otherwise to the single-cover ratio `2:3`. The `0.95` boundary sits near the midpoint between one 2:3 cover (`0.67`) and two side by side (`1.33`), so an image is handled as whichever layout it is closer to.
+If the source image's width/height is outside the double-poster band (`0.95`–`2.2`) it is handled as a single cover and not split. `side`, `midline` and `spine_trim` are ignored, and the image is cropped to `target_ratio` if given, otherwise to the single-cover ratio `2:3`. The crop window is centred on the largest detected face, shifted as needed to stay inside the image; with no face (or no face detector) it is a plain center crop. The `0.95` boundary sits near the midpoint between one 2:3 cover (`0.67`) and two side by side (`1.33`), so an image is handled as whichever layout it is closer to.
