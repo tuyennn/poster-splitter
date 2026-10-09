@@ -1,4 +1,4 @@
-"""In-memory OpenCV poster splitting: midline crop + auto face pick."""
+"""In-memory OpenCV poster splitting: midline crop + face-centred crop."""
 
 from __future__ import annotations
 
@@ -60,7 +60,7 @@ _face_lock = threading.Lock()  # FaceDetectorYN holds per-call input size
 
 def load_face_detector() -> bool:
     """Load and warm up the face detector once. Returns False if it can't be
-    used; side='auto' then returns the right half. Safe to call from
+    used; side='auto' then returns the right half of a double poster. Safe to call from
     several threads."""
     global _face_det, _face_unavailable
     if _face_det is not None:
@@ -156,24 +156,6 @@ def _detect_faces(img: np.ndarray) -> np.ndarray | None:
     return faces[:, :4] / factor
 
 
-def _face_areas(img: np.ndarray, split_x: int) -> tuple[float, float] | None:
-    """Area (px²) of the largest face in each half, as (left, right), with
-    0.0 for a half with no face. Each face counts for the half its centre is
-    in. Returns None if the detector can't be used."""
-    faces = _detect_faces(img)
-    if faces is None:
-        return None
-    if len(faces) == 0:
-        return 0.0, 0.0
-
-    x, fw, fh = faces[:, 0], faces[:, 2], faces[:, 3]
-    area = fw * fh
-    on_left = (x + fw / 2) < split_x
-    left = float(area[on_left].max()) if on_left.any() else 0.0
-    right = float(area[~on_left].max()) if (~on_left).any() else 0.0
-    return left, right
-
-
 def largest_face_center(img: np.ndarray) -> tuple[float, float] | None:
     """Centre (x, y) of the largest detected face, or None if there is no
     face (or face detection is unavailable)."""
@@ -182,15 +164,6 @@ def largest_face_center(img: np.ndarray) -> tuple[float, float] | None:
         return None
     x, y, fw, fh = faces[int(np.argmax(faces[:, 2] * faces[:, 3]))]
     return float(x + fw / 2), float(y + fh / 2)
-
-
-def pick_side(img: np.ndarray, split_x: int) -> Literal["left", "right"]:
-    """Pick the half with the biggest face in it, or the right half if no
-    face is found (or face detection is unavailable)."""
-    faces = _face_areas(img, split_x)
-    if faces is not None and max(faces) > 0.0:
-        return "left" if faces[0] >= faces[1] else "right"
-    return "right"
 
 
 def _trim_spine(img: np.ndarray, side: Literal["left", "right"], spine_trim: float) -> np.ndarray:
@@ -322,13 +295,18 @@ def split_poster(
     left = img[:, :split_x]
     right = img[:, split_x:]
 
+    if side == "auto":
+        # Some double-ratio images are one wide photo, not two covers, so
+        # don't pick a half: crop one cover's ratio around the largest face
+        # wherever it is. No face falls back to the right half below.
+        face = largest_face_center(img)
+        if face is not None:
+            return _crop_to_ratio(img, target_ratio or SINGLE_COVER_RATIO, face)
+
     if side == "left":
         chosen, chosen_side = left, "left"
-    elif side == "right":
-        chosen, chosen_side = right, "right"
     else:
-        chosen_side = pick_side(img, split_x)
-        chosen = left if chosen_side == "left" else right
+        chosen, chosen_side = right, "right"
 
     result = _trim_spine(chosen, chosen_side, spine_trim)
     if target_ratio is not None:

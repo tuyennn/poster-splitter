@@ -43,36 +43,50 @@ def busy_cover():
     return (np.random.default_rng(0).random((H, COVER_W, 3)) * 255).astype(np.uint8)
 
 
+def _cover_of(poster, x):
+    return "left" if x < poster.shape[1] / 2 else "right"
+
+
+def _crop_x0(poster, out):
+    """Where `out` (a full-height crop of `poster`) starts."""
+    for x0 in range(poster.shape[1] - out.shape[1] + 1):
+        if np.array_equal(poster[:, x0 : x0 + out.shape[1]], out):
+            return x0
+    raise AssertionError("output is not a crop of the poster")
+
+
+def _assert_face_centred(poster, face_side):
+    centre = splitter.largest_face_center(poster)
+    assert centre is not None and _cover_of(poster, centre[0]) == face_side
+    out = splitter.split_poster(poster, side="auto")
+    assert out.shape[:2] == (H, COVER_W)  # one 2:3 cover, not split at the midline
+    x0 = _crop_x0(poster, out)
+    want = int(max(0, min(poster.shape[1] - COVER_W, round(centre[0] - COVER_W / 2))))
+    assert x0 == want
+
+
 @pytest.mark.parametrize("face_side", ["left", "right"])
-def test_detects_face_only_in_its_half(face_side):
+def test_auto_crops_around_the_only_face(face_side):
     covers = [person_cover(), busy_cover()]
     if face_side == "right":
         covers.reverse()
-    left, right = splitter._face_areas(np.hstack(covers), COVER_W)
-    face, other = (left, right) if face_side == "left" else (right, left)
-    assert face > 0.0
-    assert other == 0.0
+    _assert_face_centred(np.hstack(covers), face_side)
 
 
 @pytest.mark.parametrize("face_side", ["left", "right"])
 def test_face_beats_bigger_faceless_person(face_side):
-    # Reported case: auto used to pick the cover without a face because its
-    # person was bigger. The face side must win.
+    # A big person with no visible face must not pull the crop.
     covers = [small_person_cover(), faceless_person_cover()]
     if face_side == "right":
         covers.reverse()
-    poster = np.hstack(covers)
-    faces = splitter._face_areas(poster, COVER_W)
-    face_i = 0 if face_side == "left" else 1
-    assert faces[face_i] > 0.0 and faces[1 - face_i] == 0.0
-    assert splitter.pick_side(poster, COVER_W) == face_side
+    _assert_face_centred(np.hstack(covers), face_side)
 
 
 def test_face_detection_works_on_large_poster():
     poster = np.hstack([small_person_cover(), busy_cover()])
     big = cv2.resize(poster, (poster.shape[1] * 6, poster.shape[0] * 6))
-    assert splitter._face_areas(big, big.shape[1] // 2)[0] > 0.0
-    assert splitter.pick_side(big, big.shape[1] // 2) == "left"
+    centre = splitter.largest_face_center(big)
+    assert centre is not None and centre[0] < big.shape[1] / 2
 
 
 @pytest.mark.parametrize("big_side", ["left", "right"])
@@ -81,15 +95,32 @@ def test_bigger_face_wins(big_side):
     if big_side == "right":
         covers.reverse()
     poster = np.hstack(covers)
-    assert min(splitter._face_areas(poster, COVER_W)) > 0.0  # both faces found
-    assert splitter.pick_side(poster, COVER_W) == big_side
+    assert len(splitter._detect_faces(poster)) == 2  # both faces found
+    _assert_face_centred(poster, big_side)
+
+
+def test_face_in_the_middle_of_a_double_ratio_photo():
+    # One wide photo (not two covers) with the face across the midline.
+    photo = cv2.resize(PHOTO, (H, H))
+    poster = np.full((H, 2 * COVER_W, 3), 90, np.uint8)
+    x = (poster.shape[1] - H) // 2
+    poster[:, x : x + H] = photo
+    assert splitter.classify_layout(poster) == "double"
+    out = splitter.split_poster(poster, side="auto")
+    assert out.shape[:2] == (H, COVER_W)
+    assert abs(_face_x_in(out) - COVER_W / 2) < 8
+
+
+def test_explicit_side_still_splits():
+    poster = np.hstack([person_cover(), busy_cover()])
+    assert np.array_equal(splitter.split_poster(poster, side="right"), poster[:, COVER_W:])
+    assert np.array_equal(splitter.split_poster(poster, side="left"), poster[:, :COVER_W])
 
 
 def test_no_face_returns_right():
     # A faceless person on the left doesn't count; no face means right.
     poster = np.hstack([faceless_person_cover(), busy_cover()])
-    assert splitter._face_areas(poster, COVER_W) == (0.0, 0.0)
-    assert splitter.pick_side(poster, COVER_W) == "right"
+    assert splitter.largest_face_center(poster) is None
     out = splitter.split_poster(poster, side="auto")
     assert np.array_equal(out, poster[:, COVER_W:])
 
@@ -100,8 +131,8 @@ def test_missing_model_returns_right(monkeypatch):
     monkeypatch.setattr(splitter, "FACE_MODEL_PATH", "/nonexistent/face.onnx")
     poster = np.hstack([person_cover(), busy_cover()])
     assert not splitter.load_face_detector()
-    assert splitter._face_areas(poster, COVER_W) is None
-    assert splitter.pick_side(poster, COVER_W) == "right"
+    assert splitter.largest_face_center(poster) is None
+    assert np.array_equal(splitter.split_poster(poster, side="auto"), poster[:, COVER_W:])
 
 
 def _canvas(w, h):
