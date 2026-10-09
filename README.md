@@ -9,7 +9,7 @@ Stateless FastAPI service that fetches a landscape double-DVD combo poster, crop
 | Param          | Required | Default | Description                                                                                                                    |
 |----------------|----------|---------|------------------------------------------------------------------------------------------------------------------------------------|
 | `url`          | yes      | —       | Source image URL (`http` / `https`)                                                                                              |
-| `side`         | no       | `auto`  | `left` \| `right` \| `auto` (one cover's ratio cropped around the largest detected face, else the right half)                |
+| `side`         | no       | `auto`  | `left` \| `right` \| `auto` (half holding the largest face, or a face-centred crop if that face sits across the middle; else the right half) |
 | `midline`      | no       | `0.5`   | Vertical split position as a fraction of width (`0`–`1`, exclusive)                                                              |
 | `spine_trim`   | no       | `0.02`  | Fraction of the returned half's width to trim off its inner edge (nearest the midline), to drop the spine/gutter divider. `0` disables it. |
 | `target_ratio` | no       | — (off) | Desired output aspect ratio as `W:H` (e.g. `2:3`) or a decimal (e.g. `0.6667`). Center-crops the panel to this exact ratio after spine trim. Only ever crops — never pads or upscales. |
@@ -116,12 +116,14 @@ Make sure only **one** OpenCV package is in `requirements.txt` (`opencv-python-h
 - Aspect ratio gate: 0.95–2.2 is treated as a double-poster; any other ratio is handled as a single cover
 - Any unexpected exception anywhere in the app is caught by a global handler, logged with a full traceback, and returned as a structured JSON `500` — never a bare error page
 
-## Auto face crop (`side=auto`)
+## Auto side selection (`side=auto`)
 
 This is the default when `side` is omitted.
 
-1. Run YuNet face detection (`cv2.FaceDetectorYN`, ONNX) once over the whole poster. If any face is found, don't split at all: crop to one cover's ratio (`target_ratio` if given, else `2:3`) with the window centred on the **largest face**, shifted as needed to stay inside the image. Some double-ratio images are one wide photo rather than two covers, and this keeps the face whole either way. `midline` and `spine_trim` are ignored on this path
-2. If no face is found, return the **right** half (split, spine trim and ratio crop as below)
+1. Run YuNet face detection (`cv2.FaceDetectorYN`, ONNX) once over the whole poster and take the **largest face**
+2. If that face's box overlaps the cut (the midline plus the `spine_trim` strip on each side of it), the image is most likely one wide photo and splitting would cut the face. Don't split: crop to one cover's ratio (`target_ratio` if given, else `2:3`) centred on the face, shifted as needed to stay inside the image. `midline` and `spine_trim` only decide whether this happens
+3. Otherwise the face is inside one cover: return **that half** (split, spine trim and ratio crop as below)
+4. If no face is found, return the **right** half
 
 Requires the model file at `app/models/face_detection_yunet_2023mar.onnx` (or wherever `FACE_MODEL_PATH` points — see below). It is loaded and warmed up at startup. If it's missing or unreadable, or inference fails on one image, `auto` returns the right half rather than failing the request.
 
@@ -134,10 +136,10 @@ Requires the model file at `app/models/face_detection_yunet_2023mar.onnx` (or wh
 
 ## Cropping pipeline
 
-When the panel is split (`side=left`/`right`, or `auto` with no face), it goes through, in order:
+When the panel is split (every case except an `auto` face across the middle), it goes through, in order:
 
 1. **Split** at `midline` into left/right halves
-2. **Select** a half (`left`/`right`; `auto` with no face takes the right)
+2. **Select** a half (`left`/`right`; `auto` takes the half with the largest face, else the right)
 3. **Spine trim** — remove `spine_trim` fraction off the half's inner edge
 4. **Ratio crop** (if `target_ratio` given) — center-crop to the exact requested aspect ratio
 

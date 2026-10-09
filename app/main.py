@@ -97,8 +97,9 @@ async def poster(
     side: Literal["left", "right", "auto"] = Query(
         "auto",
         description=(
-            "left or right half, or auto: one cover's ratio cropped around "
-            "the largest detected face, else the right half"
+            "left or right half, or auto: the half holding the largest "
+            "detected face; if that face sits across the middle, one cover's "
+            "ratio cropped around it instead; with no face, the right half"
         ),
     ),
     midline: float = Query(

@@ -156,14 +156,34 @@ def _detect_faces(img: np.ndarray) -> np.ndarray | None:
     return faces[:, :4] / factor
 
 
-def largest_face_center(img: np.ndarray) -> tuple[float, float] | None:
-    """Centre (x, y) of the largest detected face, or None if there is no
+def largest_face(img: np.ndarray) -> tuple[float, float, float, float] | None:
+    """Box (x, y, w, h) of the largest detected face, or None if there is no
     face (or face detection is unavailable)."""
     faces = _detect_faces(img)
     if faces is None or len(faces) == 0:
         return None
     x, y, fw, fh = faces[int(np.argmax(faces[:, 2] * faces[:, 3]))]
-    return float(x + fw / 2), float(y + fh / 2)
+    return float(x), float(y), float(fw), float(fh)
+
+
+def largest_face_center(img: np.ndarray) -> tuple[float, float] | None:
+    """Centre (x, y) of the largest detected face, or None."""
+    face = largest_face(img)
+    if face is None:
+        return None
+    x, y, fw, fh = face
+    return x + fw / 2, y + fh / 2
+
+
+def _face_hits_cut(
+    face: tuple[float, float, float, float], width: int, split_x: int, spine_trim: float
+) -> bool:
+    """True if splitting at split_x and trimming the spine would cut into
+    the face: its box overlaps the midline plus both halves' spine trim."""
+    cut_left = split_x - int(round(split_x * spine_trim))
+    cut_right = split_x + int(round((width - split_x) * spine_trim))
+    x, _, fw, _ = face
+    return x < cut_right and x + fw > cut_left
 
 
 def _trim_spine(img: np.ndarray, side: Literal["left", "right"], spine_trim: float) -> np.ndarray:
@@ -296,12 +316,18 @@ def split_poster(
     right = img[:, split_x:]
 
     if side == "auto":
-        # Some double-ratio images are one wide photo, not two covers, so
-        # don't pick a half: crop one cover's ratio around the largest face
-        # wherever it is. No face falls back to the right half below.
-        face = largest_face_center(img)
+        side = "right"  # no face
+        face = largest_face(img)
+        if face is not None and _face_hits_cut(face, width, split_x, spine_trim):
+            # The face sits across the middle, so this is likely one wide
+            # photo: splitting would cut the face. Crop one cover's ratio
+            # around it instead.
+            x, y, fw, fh = face
+            centre = (x + fw / 2, y + fh / 2)
+            return _crop_to_ratio(img, target_ratio or SINGLE_COVER_RATIO, centre)
         if face is not None:
-            return _crop_to_ratio(img, target_ratio or SINGLE_COVER_RATIO, face)
+            # The face is inside one cover: return that cover as usual.
+            side = "left" if face[0] + face[2] / 2 < split_x else "right"
 
     if side == "left":
         chosen, chosen_side = left, "left"
