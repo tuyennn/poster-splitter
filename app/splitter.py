@@ -16,16 +16,16 @@ logger = logging.getLogger(__name__)
 Side = Literal["left", "right", "auto"]
 Layout = Literal["single", "double"]
 
-# Width/height of one portrait cover. Single-cover inputs are center-cropped
-# to this when the caller doesn't pass target_ratio.
+# Width/height of one portrait cover. Single-cover inputs are cropped to
+# this (around the largest face) when the caller doesn't pass target_ratio.
 SINGLE_COVER_RATIO = 2 / 3
 
-# Aspect bands (width/height). Two 2:3 covers side by side make 4:3 (1.33),
-# one makes 0.67; SINGLE_MAX_ASPECT sits near the geometric midpoint (0.94)
-# so anything closer to one cover than to two is treated as a single cover.
-SINGLE_MIN_ASPECT = 0.45
-SINGLE_MAX_ASPECT = 0.95
-MAX_ASPECT = 2.2
+# Double-poster aspect band (width/height). Two 2:3 covers side by side make
+# 4:3 (1.33), one makes 0.67; DOUBLE_MIN_ASPECT sits near the geometric
+# midpoint (0.94) so anything closer to one cover than to two is not split.
+# Every image outside this band is handled as a single cover.
+DOUBLE_MIN_ASPECT = 0.95
+DOUBLE_MAX_ASPECT = 2.2
 
 # Decompression-bomb guard (~40 megapixels). app/__init__.py also hands this
 # limit to OpenCV so it is enforced from the image header, before decoding.
@@ -122,27 +122,17 @@ def decode_image(data: bytes) -> np.ndarray:
 
 
 def classify_layout(img: np.ndarray) -> Layout:
-    """'double' for a two-cover combo, 'single' for one portrait cover;
-    422 for anything outside both aspect bands."""
+    """'double' for a two-cover combo; 'single' for anything else."""
     height, width = img.shape[:2]
     aspect = width / height
-    if SINGLE_MIN_ASPECT <= aspect < SINGLE_MAX_ASPECT:
-        return "single"
-    if SINGLE_MAX_ASPECT <= aspect <= MAX_ASPECT:
+    if DOUBLE_MIN_ASPECT <= aspect <= DOUBLE_MAX_ASPECT:
         return "double"
-    raise SplitterError(
-        422,
-        "invalid_aspect",
-        f"Image aspect ratio {aspect:.2f} is neither a single cover "
-        f"({SINGLE_MIN_ASPECT}-{SINGLE_MAX_ASPECT}) nor a double-poster "
-        f"({SINGLE_MAX_ASPECT}-{MAX_ASPECT}).",
-    )
+    return "single"
 
 
-def _face_areas(img: np.ndarray, split_x: int) -> tuple[float, float] | None:
-    """Area (px²) of the largest face in each half, as (left, right), with
-    0.0 for a half with no face. Each face counts for the half its centre is
-    in. Returns None if the detector can't be used."""
+def _detect_faces(img: np.ndarray) -> np.ndarray | None:
+    """Faces as rows of (x, y, w, h) in img's pixel coordinates (possibly
+    zero rows). Returns None if the detector can't be used."""
     if not load_face_detector():
         return None
 
@@ -161,15 +151,37 @@ def _face_areas(img: np.ndarray, split_x: int) -> tuple[float, float] | None:
     except Exception as exc:
         logger.warning("Face detection failed for this image, skipping it: %s", exc)
         return None
-    if faces is None or len(faces) == 0:
+    if faces is None:
+        return np.empty((0, 4), np.float32)
+    return faces[:, :4] / factor
+
+
+def _face_areas(img: np.ndarray, split_x: int) -> tuple[float, float] | None:
+    """Area (px²) of the largest face in each half, as (left, right), with
+    0.0 for a half with no face. Each face counts for the half its centre is
+    in. Returns None if the detector can't be used."""
+    faces = _detect_faces(img)
+    if faces is None:
+        return None
+    if len(faces) == 0:
         return 0.0, 0.0
 
-    x, fw, fh = faces[:, 0] / factor, faces[:, 2] / factor, faces[:, 3] / factor
+    x, fw, fh = faces[:, 0], faces[:, 2], faces[:, 3]
     area = fw * fh
     on_left = (x + fw / 2) < split_x
     left = float(area[on_left].max()) if on_left.any() else 0.0
     right = float(area[~on_left].max()) if (~on_left).any() else 0.0
     return left, right
+
+
+def largest_face_center(img: np.ndarray) -> tuple[float, float] | None:
+    """Centre (x, y) of the largest detected face, or None if there is no
+    face (or face detection is unavailable)."""
+    faces = _detect_faces(img)
+    if faces is None or len(faces) == 0:
+        return None
+    x, y, fw, fh = faces[int(np.argmax(faces[:, 2] * faces[:, 3]))]
+    return float(x + fw / 2), float(y + fh / 2)
 
 
 def pick_side(img: np.ndarray, split_x: int) -> Literal["left", "right"]:
@@ -230,9 +242,23 @@ def parse_ratio(value: str) -> float:
         ) from exc
 
 
-def _crop_to_ratio(img: np.ndarray, target_ratio: float) -> np.ndarray:
-    """Center-crop img (width/height) down to target_ratio. Only ever crops
-    (never pads/upscales), so the result is always a true subset of img."""
+def _window_start(length: int, window: int, center: float | None) -> int:
+    """Start of a `window`-long span inside [0, length), centred on `center`
+    (or the middle when None) and clamped to stay in bounds."""
+    if center is None:
+        return (length - window) // 2
+    return int(max(0, min(length - window, round(center - window / 2))))
+
+
+def _crop_to_ratio(
+    img: np.ndarray,
+    target_ratio: float,
+    center: tuple[float, float] | None = None,
+) -> np.ndarray:
+    """Crop img (width/height) down to target_ratio, keeping the crop window
+    centred on `center` (x, y) as far as the image bounds allow, or on the
+    image centre when None. Only ever crops (never pads/upscales), so the
+    result is always a true subset of img."""
     height, width = img.shape[:2]
     current_ratio = width / height
 
@@ -242,12 +268,12 @@ def _crop_to_ratio(img: np.ndarray, target_ratio: float) -> np.ndarray:
     if current_ratio > target_ratio:
         # Wider than target -> crop width, keep full height
         new_width = max(1, min(width, round(height * target_ratio)))
-        x0 = (width - new_width) // 2
+        x0 = _window_start(width, new_width, center and center[0])
         return img[:, x0 : x0 + new_width]
 
     # Taller than target -> crop height, keep full width
     new_height = max(1, min(height, round(width / target_ratio)))
-    y0 = (height - new_height) // 2
+    y0 = _window_start(height, new_height, center and center[1])
     return img[y0 : y0 + new_height, :]
 
 
@@ -281,9 +307,12 @@ def split_poster(
         )
 
     if layout == "single":
-        # Already one cover: no midline split, no spine to trim — just bring
-        # it to the single-cover ratio (or the caller's target_ratio).
-        return _crop_to_ratio(img, target_ratio or SINGLE_COVER_RATIO)
+        # Not a two-cover combo: no side to choose, no midline split, no spine
+        # to trim. Crop to the single-cover ratio (or the caller's
+        # target_ratio) centred on the largest face, else on the image centre.
+        return _crop_to_ratio(
+            img, target_ratio or SINGLE_COVER_RATIO, largest_face_center(img)
+        )
 
     height, width = img.shape[:2]
     split_x = int(width * midline)
